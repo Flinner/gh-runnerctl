@@ -19,7 +19,7 @@ manager = "auto"                        # per-machine supervisor hosting: auto |
                                         # (override per pool; pools on one machine must agree)
 
 [pool.head]
-host = "user@acclhead1.example.org"     # ssh destination (alias or user@host); "" = this machine
+host = "user@machine1.example.org"     # ssh destination (alias or user@host); "" = this machine
 count = 4
 labels = ["self-hosted", "linux", "x64"]
 

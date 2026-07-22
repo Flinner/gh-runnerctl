@@ -28,15 +28,15 @@ One Python file. Standard library only. Nothing to install on remote hosts.
 ```console
 $ runnerctl status
 
-instance default   config=runners.toml   pools: head@acclhead1=4, gpu@gpunode=2
-supervisor@acclhead1 running (pid 71324, detached)
+instance default   config=runners.toml   pools: head@machine1=4, gpu@gpunode=2
+supervisor@machine1 running (pid 71324, detached)
 supervisor@gpunode running (pid 4482, systemd)
 
   POOL       IDX  NAME              RUNNER   GITHUB   JOB
-  head       1    acclhead1-head-1  running  online   idle
-  head       2    acclhead1-head-2  running  online   busy
-  head       3    acclhead1-head-3  running  online   idle
-  head       4    acclhead1-head-4  running  online   idle
+  head       1    machine1-head-1  running  online   idle
+  head       2    machine1-head-2  running  online   busy
+  head       3    machine1-head-3  running  online   idle
+  head       4    machine1-head-4  running  online   idle
   gpu        1    gpunode-gpu-1     running  online   idle
   gpu        2    gpunode-gpu-2     stopped  online   -
 ```
@@ -55,8 +55,8 @@ Every mutating command takes `--dry-run` / `-n` and prints the plan instead:
 $ runnerctl up -n
 plan for instance default (runners.toml):
   + register runner gpu/2 on gpunode as gpunode-gpu-2
-  - deregister and delete runner head/5 on acclhead1 (acclhead1-head-5, idle)
-  * reload supervisor on acclhead1 (SIGHUP pid 71324)
+  - deregister and delete runner head/5 on machine1 (machine1-head-5, idle)
+  * reload supervisor on machine1 (SIGHUP pid 71324)
 :: dry run — nothing changed
 ```
 
@@ -115,7 +115,7 @@ base_dir = "~/gh-runners"
 manager = "auto"          # per-machine supervisor hosting: auto | systemd | nohup
 
 [pool.head]
-host = "me@acclhead1.example.org"   # ssh destination (alias or user@host)
+host = "me@machine1.example.org"   # ssh destination (alias or user@host)
 count = 4
 labels = ["self-hosted", "linux", "x64"]
 
