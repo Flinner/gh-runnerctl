@@ -1,0 +1,13 @@
+# runnerctl pool configuration — `runnerctl up` converges the pool to this file.
+# Copy to runners.toml (or ~/.config/runnerctl/runners.toml) and edit.
+
+[pool]
+url = "https://github.com/YOUR-ORG"   # org URL (runners serve all repos) or a single repo URL
+count = 4                              # desired number of runners on this host
+labels = ["self-hosted", "linux", "x64"]
+base_dir = "~/actions-runner"          # runners live in <base_dir>/<dir_prefix><N>
+version = "latest"                     # runner release, e.g. "2.335.1", or "latest"
+name_prefix = ""                       # GitHub-side names <prefix>-<N>; default: this hostname
+manager = "auto"                       # auto | systemd | nohup (both sudoless)
+group = ""                             # optional runner group (org-level only)
+dir_prefix = "runner"                  # set "actions" to adopt an existing actions<N> layout

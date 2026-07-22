@@ -1,0 +1,1003 @@
+#!/usr/bin/env python3
+# runnerctl — sudoless, config-driven pool manager for self-hosted GitHub Actions runners.
+# Single file, Python 3.6+ standard library only.
+# https://github.com/flinner/gh-runnerctl
+
+import argparse
+import getpass
+import json
+import os
+import platform
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.error
+import urllib.request
+
+API_ROOT = "https://api.github.com"
+UNIT_NAME = "gh-runner@{}.service"
+UNIT_PATH = os.path.expanduser("~/.config/systemd/user/gh-runner@.service")
+
+DEFAULTS = {
+    "url": "",
+    "count": 2,
+    "labels": ["self-hosted"],
+    "base_dir": "~/actions-runner",
+    "version": "latest",
+    "name_prefix": "",
+    "manager": "auto",
+    "group": "",
+    "dir_prefix": "runner",
+}
+
+CONFIG_TEMPLATE = '''# runnerctl pool configuration — `runnerctl up` converges the pool to this file.
+
+[pool]
+url = "https://github.com/YOUR-ORG"   # org URL (runners serve all repos) or a single repo URL
+count = 4                              # desired number of runners on this host
+labels = ["self-hosted", "linux", "x64"]
+base_dir = "~/actions-runner"          # runners live in <base_dir>/<dir_prefix><N>
+version = "latest"                     # runner release, e.g. "2.335.1", or "latest"
+name_prefix = ""                       # GitHub-side names <prefix>-<N>; default: this hostname
+manager = "auto"                       # auto | systemd | nohup (both sudoless)
+group = ""                             # optional runner group (org-level only)
+dir_prefix = "runner"                  # set "actions" to adopt an existing actions<N> layout
+'''
+
+
+class Err(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- output
+
+GREEN, RED, YELLOW, DIM, CYAN, BOLD = "32", "31", "33", "2", "36", "1"
+
+
+def _tty():
+    return sys.stdout.isatty()
+
+
+def paint(s, code):
+    if _tty():
+        return "\033[{}m{}\033[0m".format(code, s)
+    return s
+
+
+def info(msg):
+    print(paint("::", CYAN) + " " + msg)
+
+
+def ok(msg):
+    print(paint("ok", GREEN) + " " + msg)
+
+
+def warn(msg):
+    print(paint("!!", YELLOW) + " " + msg, file=sys.stderr)
+
+
+def run(cmd, cwd=None, check=False):
+    p = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, universal_newlines=True)
+    if check and p.returncode != 0:
+        raise Err("command failed ({}): {}\n{}".format(
+            p.returncode, " ".join(cmd), (p.stdout or "").strip()))
+    return p
+
+
+# ---------------------------------------------------------------- config
+
+def _strip_comment(s):
+    out, instr, q = [], False, ""
+    for ch in s:
+        if instr:
+            out.append(ch)
+            if ch == q:
+                instr = False
+        elif ch in "\"'":
+            instr, q = True, ch
+            out.append(ch)
+        elif ch == "#":
+            break
+        else:
+            out.append(ch)
+    return "".join(out).strip()
+
+
+def _parse_val(s):
+    s = s.strip()
+    if s.startswith("["):
+        if not s.endswith("]"):
+            raise ValueError("arrays must be on one line: " + s)
+        inner = s[1:-1].strip()
+        if not inner:
+            return []
+        items, buf, instr, q = [], "", False, ""
+        for ch in inner:
+            if instr:
+                buf += ch
+                if ch == q:
+                    instr = False
+            elif ch in "\"'":
+                instr, q = True, ch
+                buf += ch
+            elif ch == ",":
+                items.append(buf.strip())
+                buf = ""
+            else:
+                buf += ch
+        if buf.strip():
+            items.append(buf.strip())
+        return [_parse_val(x) for x in items]
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        return s[1:-1]
+    if s == "true":
+        return True
+    if s == "false":
+        return False
+    try:
+        return int(s)
+    except ValueError:
+        raise ValueError("unquoted value: " + s)
+
+
+def _parse_toml_min(text):
+    """Minimal TOML subset: [tables], strings, ints, bools, one-line string arrays."""
+    root, cur = {}, None
+    cur = root
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = _strip_comment(raw.strip())
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            cur = root.setdefault(line[1:-1].strip(), {})
+            continue
+        if "=" not in line:
+            raise ValueError("line {}: expected key = value".format(lineno))
+        key, val = line.split("=", 1)
+        try:
+            cur[key.strip()] = _parse_val(val)
+        except ValueError as e:
+            raise ValueError("line {}: {}".format(lineno, e))
+    return root
+
+
+try:
+    import tomllib
+
+    def parse_toml(text):
+        return tomllib.loads(text)
+except ImportError:
+    parse_toml = _parse_toml_min
+
+
+class Config:
+    def __init__(self, data, path):
+        for k, v in data.items():
+            setattr(self, k, v)
+        self.path = path
+
+
+def find_config(explicit):
+    candidates = []
+    if explicit:
+        candidates.append(explicit)
+    if os.environ.get("RUNNERCTL_CONFIG"):
+        candidates.append(os.environ["RUNNERCTL_CONFIG"])
+    candidates.append("runners.toml")
+    candidates.append(os.path.expanduser("~/.config/runnerctl/runners.toml"))
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    raise Err("no runners.toml found (searched: {})\nrun `runnerctl init` to create one".format(
+        ", ".join(candidates)))
+
+
+def split_url(url):
+    m = re.match(r"https?://github\.com/([^/\s]+?)(?:/([^/\s]+?))?/?$", url.strip())
+    if not m:
+        raise Err("unsupported url {!r}: expected https://github.com/<org> "
+                  "or https://github.com/<owner>/<repo>".format(url))
+    return m.group(1), m.group(2)
+
+
+def api_scope(url):
+    owner, repo = split_url(url)
+    if repo:
+        return "repos/{}/{}".format(owner, repo)
+    return "orgs/{}".format(owner)
+
+
+def load_config(path):
+    with open(path) as f:
+        text = f.read()
+    try:
+        doc = parse_toml(text)
+    except Exception as e:
+        raise Err("cannot parse {}: {}".format(path, e))
+    pool = doc.get("pool", {})
+    if not isinstance(pool, dict):
+        raise Err("{}: [pool] must be a table".format(path))
+    unknown = sorted(set(pool) - set(DEFAULTS))
+    if unknown:
+        warn("{}: ignoring unknown key(s): {}".format(path, ", ".join(unknown)))
+    data = dict(DEFAULTS)
+    data.update({k: v for k, v in pool.items() if k in DEFAULTS})
+    if not data["url"] or "YOUR-ORG" in data["url"]:
+        raise Err("set `url` in {} to your org or repo".format(path))
+    api_scope(data["url"])  # validate shape early
+    if not isinstance(data["count"], int) or data["count"] < 0:
+        raise Err("{}: count must be a non-negative integer".format(path))
+    if isinstance(data["labels"], str):
+        data["labels"] = [data["labels"]]
+    if not data["labels"] or not all(isinstance(x, str) for x in data["labels"]):
+        raise Err("{}: labels must be a non-empty list of strings".format(path))
+    if data["manager"] not in ("auto", "systemd", "nohup"):
+        raise Err('{}: manager must be "auto", "systemd" or "nohup"'.format(path))
+    data["base_dir"] = os.path.abspath(os.path.expanduser(str(data["base_dir"])))
+    data["version"] = str(data["version"])
+    if not data["name_prefix"]:
+        data["name_prefix"] = socket.gethostname().split(".")[0]
+    return Config(data, path)
+
+
+# ---------------------------------------------------------------- GitHub
+
+def get_token():
+    for var in ("GITHUB_TOKEN", "GH_TOKEN"):
+        if os.environ.get(var):
+            return os.environ[var].strip()
+    if shutil.which("gh"):
+        p = run(["gh", "auth", "token"])
+        if p.returncode == 0 and (p.stdout or "").strip():
+            return p.stdout.strip().splitlines()[-1]
+    return None
+
+
+def api(method, path, token, body=None):
+    url = path if path.startswith("http") else "{}/{}".format(API_ROOT, path)
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("X-GitHub-Api-Version", "2022-11-28")
+    req.add_header("User-Agent", "runnerctl")
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")
+        try:
+            detail = json.loads(detail).get("message", detail)
+        except ValueError:
+            pass
+        raise Err("GitHub API {} {} -> HTTP {}: {}".format(method, path, e.code, detail))
+    except urllib.error.URLError as e:
+        raise Err("GitHub API unreachable: {}".format(e.reason))
+    if not raw:
+        return {}
+    return json.loads(raw.decode("utf-8"))
+
+
+class GitHub:
+    """Token acquisition ladder: GITHUB_TOKEN/GH_TOKEN -> gh CLI -> interactive prompt.
+
+    With an API token, registration/removal tokens are minted automatically and
+    remote runner status is available. Without one, the user is prompted to paste
+    tokens from the GitHub settings pages (valid ~1h, reused within the run) and
+    remote status/busy checks are unavailable.
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.scope = api_scope(cfg.url)
+        self.token = get_token()
+        self._reg = None
+        self._rem = None
+        self._warned = False
+
+    @property
+    def manual(self):
+        return self.token is None
+
+    def warn_manual(self, what):
+        if not self._warned:
+            warn("no GitHub token (GITHUB_TOKEN / `gh auth login`): {}".format(what))
+            self._warned = True
+
+    def _settings_page(self):
+        owner, repo = split_url(self.cfg.url)
+        if repo:
+            return "https://github.com/{}/{}/settings/actions/runners".format(owner, repo)
+        return "https://github.com/organizations/{}/settings/actions/runners".format(owner)
+
+    def _prompt(self, kind, page):
+        if not sys.stdin.isatty():
+            raise Err("no GitHub token and stdin is not a terminal; "
+                      "set GITHUB_TOKEN or run interactively")
+        self.warn_manual("switching to manually pasted tokens")
+        print()
+        info("open:  {}".format(page))
+        info("copy the value shown after --token in the {} command".format(kind))
+        try:
+            val = input("paste {} token (empty aborts): ".format(kind)).strip()
+        except EOFError:
+            val = ""
+        print()
+        if not val:
+            raise Err("aborted: no {} token provided".format(kind))
+        return val
+
+    def reg_token(self, refresh=False):
+        if self.manual:
+            if self._reg is None or refresh:
+                self._reg = self._prompt("registration", self._settings_page() + "/new")
+            return self._reg
+        return api("POST", self.scope + "/actions/runners/registration-token",
+                   self.token)["token"]
+
+    def rem_token(self, refresh=False):
+        if self.manual:
+            if self._rem is None or refresh:
+                self._rem = self._prompt("removal", self._settings_page())
+            return self._rem
+        return api("POST", self.scope + "/actions/runners/remove-token",
+                   self.token)["token"]
+
+    def runners(self):
+        """name -> API entry for every runner registered at this scope."""
+        if self.manual:
+            return {}
+        out, page = {}, 1
+        while True:
+            r = api("GET", "{}/actions/runners?per_page=100&page={}".format(self.scope, page),
+                    self.token)
+            batch = r.get("runners", [])
+            for x in batch:
+                out[x.get("name")] = x
+            if len(batch) < 100:
+                break
+            page += 1
+        return out
+
+    def delete_runner(self, runner_id):
+        api("DELETE", "{}/actions/runners/{}".format(self.scope, runner_id), self.token)
+
+
+# ---------------------------------------------------------------- local pool state
+
+def runner_dir(cfg, i):
+    return os.path.join(cfg.base_dir, "{}{}".format(cfg.dir_prefix, i))
+
+
+def registered_name(cfg, i):
+    path = os.path.join(runner_dir(cfg, i), ".runner")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            return json.load(f).get("agentName")
+    except (ValueError, OSError):
+        return None
+
+
+def local_indices(cfg):
+    if not os.path.isdir(cfg.base_dir):
+        return []
+    pat = re.compile(r"{}(\d+)$".format(re.escape(cfg.dir_prefix)))
+    out = []
+    for entry in os.listdir(cfg.base_dir):
+        m = pat.match(entry)
+        if m and os.path.isdir(os.path.join(cfg.base_dir, entry)):
+            out.append(int(m.group(1)))
+    return sorted(out)
+
+
+def default_name(cfg, i):
+    return "{}-{}".format(cfg.name_prefix, i)
+
+
+# ---------------------------------------------------------------- runner package
+
+def runner_arch():
+    m = platform.machine().lower()
+    if m in ("x86_64", "amd64"):
+        return "x64"
+    if m in ("aarch64", "arm64"):
+        return "arm64"
+    raise Err("unsupported architecture: " + m)
+
+
+def resolve_version(cfg, gh):
+    if cfg.version and cfg.version != "latest":
+        return cfg.version.lstrip("v")
+    rel = api("GET", "repos/actions/runner/releases/latest", gh.token)
+    return rel["tag_name"].lstrip("v")
+
+
+def ensure_tarball(cfg, version):
+    name = "actions-runner-linux-{}-{}.tar.gz".format(runner_arch(), version)
+    path = os.path.join(cfg.base_dir, name)
+    if os.path.isfile(path):
+        return path
+    url = "https://github.com/actions/runner/releases/download/v{}/{}".format(version, name)
+    info("downloading {}".format(name))
+    os.makedirs(cfg.base_dir, exist_ok=True)
+    tmp = path + ".part"
+    try:
+        urllib.request.urlretrieve(url, tmp)
+    except (urllib.error.URLError, OSError) as e:
+        raise Err("download failed: {}".format(e))
+    os.replace(tmp, path)
+    return path
+
+
+# ---------------------------------------------------------------- process managers
+
+class SystemdManager:
+    kind = "systemd"
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    @staticmethod
+    def available():
+        if not shutil.which("systemctl"):
+            return False
+        p = run(["systemctl", "--user", "is-system-running"])
+        state = (p.stdout or "").strip().splitlines()
+        state = state[0] if state else ""
+        return state in ("running", "degraded", "starting", "initializing", "maintenance")
+
+    def unit(self, i):
+        return UNIT_NAME.format(i)
+
+    def setup(self):
+        body = (
+            "# managed by runnerctl\n"
+            "[Unit]\n"
+            "Description=GitHub Actions runner %i (runnerctl)\n"
+            "After=network-online.target\n"
+            "\n"
+            "[Service]\n"
+            "WorkingDirectory={base}/{prefix}%i\n"
+            "ExecStart={base}/{prefix}%i/run.sh\n"
+            "Restart=always\n"
+            "RestartSec=10\n"
+            "KillSignal=SIGINT\n"
+            "TimeoutStopSec=90\n"
+            "\n"
+            "[Install]\n"
+            "WantedBy=default.target\n"
+        ).format(base=self.cfg.base_dir, prefix=self.cfg.dir_prefix)
+        current = None
+        if os.path.isfile(UNIT_PATH):
+            with open(UNIT_PATH) as f:
+                current = f.read()
+        if current != body:
+            os.makedirs(os.path.dirname(UNIT_PATH), exist_ok=True)
+            with open(UNIT_PATH, "w") as f:
+                f.write(body)
+            run(["systemctl", "--user", "daemon-reload"])
+            info("installed user unit {}".format(UNIT_PATH))
+        self._ensure_linger()
+
+    def _ensure_linger(self):
+        user = getpass.getuser()
+        p = run(["loginctl", "show-user", user, "--property=Linger", "--value"])
+        if p.returncode == 0 and (p.stdout or "").strip() == "yes":
+            return
+        q = run(["loginctl", "enable-linger", user])
+        if q.returncode == 0:
+            ok("enabled session linger (runners survive logout)")
+        else:
+            warn("could not enable linger; runners may stop when your last session ends "
+                 "(an admin can run: loginctl enable-linger {})".format(user))
+
+    def start(self, i):
+        run(["systemctl", "--user", "enable", "--now", self.unit(i)], check=True)
+
+    def stop(self, i):
+        run(["systemctl", "--user", "disable", "--now", self.unit(i)])
+
+    def restart(self, i):
+        run(["systemctl", "--user", "restart", self.unit(i)], check=True)
+
+    def state(self, i):
+        p = run(["systemctl", "--user", "is-active", self.unit(i)])
+        return (p.stdout or "").strip() or "-"
+
+    def logs(self, i, follow):
+        cmd = ["journalctl", "--user", "-u", self.unit(i), "-n", "100", "--no-pager"]
+        if follow:
+            cmd.append("-f")
+        os.execvp(cmd[0], cmd)
+
+
+class NohupManager:
+    """Fallback for hosts without a systemd user bus (common on HPC login nodes).
+
+    Detached process groups with pidfiles; no restart-on-crash.
+    """
+    kind = "nohup"
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    @staticmethod
+    def available():
+        return True
+
+    def setup(self):
+        pass
+
+    def _pidfile(self, i):
+        return os.path.join(runner_dir(self.cfg, i), ".runnerctl.pid")
+
+    def _logfile(self, i):
+        return os.path.join(runner_dir(self.cfg, i), "runner.log")
+
+    def _pid(self, i):
+        try:
+            with open(self._pidfile(i)) as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _alive(pid):
+        if pid is None:
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+    def start(self, i):
+        if self._alive(self._pid(i)):
+            return
+        d = runner_dir(self.cfg, i)
+        script = os.path.join(d, "run.sh")
+        if not os.path.isfile(script):
+            raise Err("no run.sh in {} (not provisioned?)".format(d))
+        with open(self._logfile(i), "ab") as logf:
+            p = subprocess.Popen([script], cwd=d, stdout=logf, stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL, start_new_session=True)
+        with open(self._pidfile(i), "w") as f:
+            f.write(str(p.pid))
+
+    def stop(self, i):
+        pid = self._pid(i)
+        if not self._alive(pid):
+            self._cleanup(i)
+            return
+        for sig, patience in ((signal.SIGINT, 30), (signal.SIGTERM, 10), (signal.SIGKILL, 5)):
+            try:
+                os.killpg(pid, sig)
+            except ProcessLookupError:
+                break
+            deadline = time.time() + patience
+            while time.time() < deadline and self._alive(pid):
+                time.sleep(0.5)
+            if not self._alive(pid):
+                break
+        self._cleanup(i)
+
+    def _cleanup(self, i):
+        try:
+            os.remove(self._pidfile(i))
+        except OSError:
+            pass
+
+    def restart(self, i):
+        self.stop(i)
+        self.start(i)
+
+    def state(self, i):
+        return "active" if self._alive(self._pid(i)) else "inactive"
+
+    def logs(self, i, follow):
+        logf = self._logfile(i)
+        if not os.path.isfile(logf):
+            raise Err("no log file yet: {}".format(logf))
+        cmd = ["tail", "-n", "100"] + (["-f"] if follow else []) + [logf]
+        os.execvp(cmd[0], cmd)
+
+
+def pick_manager(cfg, announce=False):
+    if cfg.manager == "systemd":
+        if not SystemdManager.available():
+            raise Err("manager=systemd but the systemd user bus is unavailable "
+                      '(set manager = "nohup" in {})'.format(cfg.path))
+        return SystemdManager(cfg)
+    if cfg.manager == "nohup":
+        return NohupManager(cfg)
+    if SystemdManager.available():
+        return SystemdManager(cfg)
+    if announce:
+        warn("systemd user bus unavailable; using nohup manager (no restart-on-crash)")
+    return NohupManager(cfg)
+
+
+# ---------------------------------------------------------------- pool operations
+
+def provision(cfg, i, gh, tarball):
+    d = runner_dir(cfg, i)
+    os.makedirs(d, exist_ok=True)
+    if not os.path.isfile(os.path.join(d, "config.sh")):
+        info("extracting runner into {}".format(d))
+        with tarfile.open(tarball) as tf:
+            try:
+                tf.extractall(d, filter="tar")
+            except TypeError:
+                tf.extractall(d)
+    name = default_name(cfg, i)
+    refresh = False
+    while True:
+        reg = gh.reg_token(refresh=refresh)
+        cmd = [os.path.join(d, "config.sh"), "--unattended", "--url", cfg.url,
+               "--token", reg, "--name", name,
+               "--labels", ",".join(cfg.labels), "--replace"]
+        if cfg.group:
+            cmd += ["--runnergroup", cfg.group]
+        info("registering {}".format(name))
+        p = run(cmd, cwd=d)
+        if p.returncode == 0:
+            break
+        detail = (p.stdout or "").strip()
+        if gh.manual:
+            warn("config.sh failed for {}:\n{}".format(name, detail))
+            info("the pasted token may be expired or spent; provide a fresh one")
+            refresh = True
+            continue
+        raise Err("config.sh failed for {}:\n{}".format(name, detail))
+    ok("registered {}".format(name))
+
+
+def decommission(cfg, i, gh, mgr, remote, force):
+    d = runner_dir(cfg, i)
+    name = registered_name(cfg, i) or default_name(cfg, i)
+    entry = remote.get(name)
+    if entry and entry.get("busy") and not force:
+        warn("{} is running a job; skipped (re-run with --force to kill it)".format(name))
+        return False
+    mgr.stop(i)
+    if registered_name(cfg, i):
+        refresh = False
+        while True:
+            rem = gh.rem_token(refresh=refresh)
+            p = run([os.path.join(d, "config.sh"), "remove", "--token", rem], cwd=d)
+            if p.returncode == 0:
+                break
+            if gh.manual:
+                warn("config.sh remove failed for {}:\n{}".format(
+                    name, (p.stdout or "").strip()))
+                info("the pasted token may be expired; provide a fresh one")
+                refresh = True
+                continue
+            if entry:
+                gh.delete_runner(entry["id"])
+                warn("config.sh remove failed; deleted {} via the API instead".format(name))
+            else:
+                warn("config.sh remove failed and {} is unknown to GitHub; "
+                     "deleting the directory anyway".format(name))
+            break
+    shutil.rmtree(d, ignore_errors=True)
+    ok("removed runner {} ({})".format(i, name))
+    return True
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_init(dest):
+    if os.path.exists(dest):
+        raise Err("{} already exists".format(dest))
+    with open(dest, "w") as f:
+        f.write(CONFIG_TEMPLATE)
+    ok("wrote {} — set url (and count), then run `runnerctl up`".format(dest))
+
+
+def cmd_up(cfg, count=None, force=False):
+    gh = GitHub(cfg)
+    mgr = pick_manager(cfg, announce=True)
+    mgr.setup()
+    target = cfg.count if count is None else count
+    if target < 0:
+        raise Err("count must be >= 0")
+    if count is not None and count != cfg.count:
+        info("converging to {} (config says {}; edit {} to persist)".format(
+            count, cfg.count, cfg.path))
+    tarball = None
+    for i in range(1, target + 1):
+        if not registered_name(cfg, i):
+            if tarball is None:
+                tarball = ensure_tarball(cfg, resolve_version(cfg, gh))
+            provision(cfg, i, gh, tarball)
+        if mgr.state(i) != "active":
+            mgr.start(i)
+            info("started runner {}".format(i))
+    extra = [i for i in local_indices(cfg) if i > target]
+    if extra:
+        if gh.manual:
+            gh.warn_manual("cannot check busy state; surplus runners are "
+                           "stopped and removed as-is")
+        remote = gh.runners()
+        for i in sorted(extra, reverse=True):
+            decommission(cfg, i, gh, mgr, remote, force)
+    ok("pool converged to {} runner(s)".format(target))
+    cmd_status(cfg)
+
+
+def cmd_down(cfg, force=False):
+    mgr = pick_manager(cfg)
+    gh = GitHub(cfg)
+    remote = {}
+    if gh.manual:
+        gh.warn_manual("cannot check busy state before stopping")
+    else:
+        try:
+            remote = gh.runners()
+        except Err as e:
+            warn(str(e))
+    stopped = 0
+    for i in local_indices(cfg):
+        name = registered_name(cfg, i)
+        entry = remote.get(name) if name else None
+        if entry and entry.get("busy") and not force:
+            warn("{} is running a job; left running (use --force)".format(name))
+            continue
+        was_active = mgr.state(i) == "active"
+        mgr.stop(i)
+        if was_active:
+            stopped += 1
+    ok("stopped {} runner(s); registrations kept (`runnerctl up` resumes)".format(stopped))
+
+
+def cmd_rm(cfg, indices, all_flag, force):
+    have = local_indices(cfg)
+    targets = have if all_flag else sorted(set(indices))
+    if not targets:
+        raise Err("nothing to remove: pass indices or --all")
+    bad = [i for i in targets if i not in have]
+    if bad:
+        raise Err("no such runner(s): {}".format(", ".join(map(str, bad))))
+    gh = GitHub(cfg)
+    mgr = pick_manager(cfg)
+    if gh.manual:
+        gh.warn_manual("cannot check busy state before removal")
+    remote = gh.runners()
+    removed = []
+    for i in sorted(targets, reverse=True):
+        if decommission(cfg, i, gh, mgr, remote, force):
+            removed.append(i)
+    still_wanted = [i for i in removed if i <= cfg.count]
+    if still_wanted:
+        warn("config still wants count={}; the next `runnerctl up` will "
+             "re-provision {}".format(cfg.count, ", ".join(map(str, sorted(still_wanted)))))
+
+
+def cmd_svc(cfg, action, indices, force=False):
+    have = local_indices(cfg)
+    if not have:
+        raise Err("no runners provisioned; run `runnerctl up`")
+    targets = sorted(set(indices)) if indices else have
+    bad = [i for i in targets if i not in have]
+    if bad:
+        raise Err("no such runner(s): {}".format(", ".join(map(str, bad))))
+    mgr = pick_manager(cfg, announce=True)
+    if action in ("start", "restart"):
+        mgr.setup()
+    busy = {}
+    if action in ("stop", "restart") and not force:
+        gh = GitHub(cfg)
+        if gh.manual:
+            gh.warn_manual("cannot check busy state")
+        else:
+            try:
+                busy = {n: e for n, e in gh.runners().items() if e.get("busy")}
+            except Err as e:
+                warn(str(e))
+    past = {"start": "started", "stop": "stopped", "restart": "restarted"}[action]
+    for i in targets:
+        name = registered_name(cfg, i)
+        if name and name in busy:
+            warn("{} is running a job; skipped (use --force)".format(name))
+            continue
+        getattr(mgr, action)(i)
+        ok("{} runner {}".format(past, i))
+
+
+def cmd_status(cfg):
+    mgr = pick_manager(cfg)
+    gh = GitHub(cfg)
+    remote, api_err = {}, None
+    if gh.manual:
+        api_err = "no GitHub token (set GITHUB_TOKEN or `gh auth login`)"
+    else:
+        try:
+            remote = gh.runners()
+        except Err as e:
+            api_err = str(e)
+    have = local_indices(cfg)
+    indices = sorted(set(have) | set(range(1, cfg.count + 1)))
+    print()
+    print("{} {}   manager={}   base={}   config: count={}".format(
+        paint("pool", BOLD), cfg.url, mgr.kind, cfg.base_dir, cfg.count))
+    if api_err:
+        warn("GitHub side unavailable: " + api_err)
+    rows = [[("IDX", None), ("NAME", None), ("SERVICE", None),
+             ("GITHUB", None), ("JOB", None), ("", None)]]
+    matched = set()
+    for i in indices:
+        provisioned = i in have
+        name = registered_name(cfg, i) if provisioned else None
+        note = ""
+        if not provisioned:
+            rows.append([(str(i), None), (default_name(cfg, i), DIM), ("-", DIM),
+                         ("-", DIM), ("-", DIM), ("not provisioned (runnerctl up)", DIM)])
+            continue
+        display = name or default_name(cfg, i)
+        svc = mgr.state(i)
+        if name:
+            matched.add(name)
+            entry = remote.get(name)
+            if entry:
+                gh_state = entry.get("status", "?")
+                job = "busy" if entry.get("busy") else "idle"
+            elif api_err:
+                gh_state, job = "?", "?"
+            else:
+                gh_state, job = "unregistered", "-"
+        else:
+            gh_state, job = "unconfigured", "-"
+            note = "directory exists but was never registered"
+        if i > cfg.count:
+            note = "above configured count (pruned on next up)"
+        rows.append([
+            (str(i), None),
+            (display, None),
+            (svc, {"active": GREEN, "failed": RED}.get(svc, DIM)),
+            (gh_state, {"online": GREEN, "offline": RED,
+                        "unregistered": YELLOW, "unconfigured": YELLOW}.get(gh_state, DIM)),
+            (job, {"busy": YELLOW, "idle": GREEN}.get(job, DIM)),
+            (note, DIM),
+        ])
+    prefix = cfg.name_prefix + "-"
+    for n in sorted(remote):
+        if not n or not n.startswith(prefix) or n in matched:
+            continue
+        e = remote[n]
+        rows.append([
+            ("-", DIM),
+            (n, None),
+            ("-", DIM),
+            (e.get("status", "?"), {"online": GREEN, "offline": RED}.get(e.get("status"), DIM)),
+            ("busy" if e.get("busy") else "idle", DIM),
+            ("registered on GitHub but no local directory", YELLOW),
+        ])
+    widths = [max(len(r[c][0]) for r in rows) for c in range(len(rows[0]))]
+    print()
+    for ri, r in enumerate(rows):
+        cells = []
+        for c, (text, color) in enumerate(r):
+            cell = text.ljust(widths[c])
+            if ri == 0:
+                cell = paint(cell, BOLD)
+            elif color:
+                cell = paint(cell, color)
+            cells.append(cell)
+        print(("  " + "  ".join(cells)).rstrip())
+    print()
+
+
+def cmd_logs(cfg, idx, follow):
+    have = local_indices(cfg)
+    if not have:
+        raise Err("no runners provisioned; run `runnerctl up`")
+    if idx is None:
+        if len(have) == 1:
+            idx = have[0]
+        else:
+            raise Err("multiple runners; pick one: runnerctl logs <idx>")
+    if idx not in have:
+        raise Err("no such runner: {}".format(idx))
+    pick_manager(cfg).logs(idx, follow)
+
+
+def cmd_config(cfg):
+    mgr = pick_manager(cfg)
+    print("config file: {}".format(cfg.path))
+    for key in ("url", "count", "labels", "base_dir", "version",
+                "name_prefix", "manager", "group", "dir_prefix"):
+        val = getattr(cfg, key)
+        shown = val if isinstance(val, str) else json.dumps(val)
+        extra = "  (resolves to: {})".format(mgr.kind) if key == "manager" and val == "auto" else ""
+        print("  {} = {}{}".format(key, shown, extra))
+
+
+# ---------------------------------------------------------------- entry point
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="runnerctl",
+        description="Sudoless, config-driven pool manager for self-hosted "
+                    "GitHub Actions runners.")
+    ap.add_argument("-c", "--config", metavar="FILE",
+                    help="config file (default: ./runners.toml, "
+                         "~/.config/runnerctl/runners.toml)")
+    sub = ap.add_subparsers(dest="cmd", metavar="command")
+    sub.required = True
+
+    sub.add_parser("init", help="write a starter runners.toml here")
+    p = sub.add_parser("up", help="converge the pool to the config "
+                                  "(provision, register, start, prune)")
+    p.add_argument("--count", type=int, metavar="N",
+                   help="override the configured count for this run")
+    p.add_argument("--force", action="store_true",
+                   help="prune surplus runners even if busy")
+    p = sub.add_parser("scale", help="converge to exactly N runners (up --count N)")
+    p.add_argument("n", type=int)
+    p.add_argument("--force", action="store_true")
+    sub.add_parser("status", aliases=["ps"],
+                   help="show pool status (local dirs + services + GitHub)")
+    p = sub.add_parser("down", help="stop all runners; keep registrations")
+    p.add_argument("--force", action="store_true", help="stop even busy runners")
+    p = sub.add_parser("rm", help="deregister and delete runners")
+    p.add_argument("idx", nargs="*", type=int)
+    p.add_argument("--all", action="store_true")
+    p.add_argument("--force", action="store_true")
+    for name, hlp in (("start", "start runner services"),
+                      ("stop", "stop runner services"),
+                      ("restart", "restart runner services")):
+        p = sub.add_parser(name, help=hlp)
+        p.add_argument("idx", nargs="*", type=int)
+        if name in ("stop", "restart"):
+            p.add_argument("--force", action="store_true",
+                           help="proceed even if the runner is busy")
+    p = sub.add_parser("logs", help="show a runner's logs")
+    p.add_argument("idx", nargs="?", type=int)
+    p.add_argument("-f", "--follow", action="store_true")
+    sub.add_parser("config", help="print the resolved configuration")
+
+    args = ap.parse_args(argv)
+    try:
+        if args.cmd == "init":
+            cmd_init(args.config or "runners.toml")
+            return 0
+        cfg = load_config(find_config(args.config))
+        if args.cmd == "up":
+            cmd_up(cfg, args.count, args.force)
+        elif args.cmd == "scale":
+            cmd_up(cfg, args.n, args.force)
+        elif args.cmd in ("status", "ps"):
+            cmd_status(cfg)
+        elif args.cmd == "down":
+            cmd_down(cfg, args.force)
+        elif args.cmd == "rm":
+            cmd_rm(cfg, args.idx, args.all, args.force)
+        elif args.cmd in ("start", "stop", "restart"):
+            cmd_svc(cfg, args.cmd, args.idx, getattr(args, "force", False))
+        elif args.cmd == "logs":
+            cmd_logs(cfg, args.idx, args.follow)
+        elif args.cmd == "config":
+            cmd_config(cfg)
+    except Err as e:
+        print(paint("error:", RED) + " " + str(e), file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print()
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
