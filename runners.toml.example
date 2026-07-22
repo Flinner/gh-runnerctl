@@ -1,40 +1,38 @@
-# runnerctl pool configuration — `runnerctl up` converges the pool to this file.
-# Copy to runners.toml (or ~/.config/runnerctl/runners.toml) and edit.
+# runnerctl configuration — the config file IS the interface:
+# edit it, then `runnerctl up` (full converge, does GitHub registration work)
+# or `runnerctl reload` (soft apply to the running supervisor, no GitHub work).
+#
+# One file = one supervisor service; it may define any number of pools.
 
-[pool]
-name = "default"                       # pool identity: names the supervisor service and its state
-url = "https://github.com/YOUR-ORG"   # org URL (runners serve all repos) or a single repo URL
-count = 4                              # desired number of runners on this host
+name = "default"                        # instance name -> runnerctl-<name>.service
+manager = "auto"                        # how the supervisor is hosted: auto | systemd | nohup
+
+[defaults]                              # keys shared by every pool below
+url = "https://github.com/YOUR-ORG"    # org URL (runners serve all repos) or a repo URL
+base_dir = "~/actions-runner"           # runners live in <base_dir>/<dir_prefix><N>
+version = "latest"                      # runner release, e.g. "2.335.1", or "latest"
+name_prefix = ""                        # GitHub-side name prefix; default: this hostname
+
+[pool.main]
+count = 4
 labels = ["self-hosted", "linux", "x64"]
-base_dir = "~/actions-runner"          # runners live in <base_dir>/<dir_prefix><N>
-version = "latest"                     # runner release, e.g. "2.335.1", or "latest"
-name_prefix = ""                       # GitHub-side names <prefix>-<N>; default: this hostname
-manager = "auto"                       # how the supervisor is hosted: auto | systemd | nohup
-group = ""                             # optional runner group (org-level only)
-dir_prefix = "runner"                  # set "actions" to adopt an existing actions<N> layout
+
+[pool.gpu]
+count = 2
+labels = ["self-hosted", "linux", "x64", "gpu", "cuda"]
+# every [defaults] key can be overridden per pool:
+# url = "https://github.com/YOUR-ORG/special-repo"
+# group = "gpu-runners"                 # org runner group
 
 # ---------------------------------------------------------------------------
-# Multiple pools on one host
+# Notes
 #
-# One config file = one pool = one supervisor service. To run several pools
-# (different orgs, labels, or repo scopes), write one file per pool with a
-# distinct `name`, and address each with -c:
-#
-#     runnerctl -c runners.toml up          # pool "default"
-#     runnerctl -c gpu.toml up              # pool "gpu"
-#     runnerctl -c gpu.toml status
-#
-# gpu.toml:
-#
-#     [pool]
-#     name = "gpu"                          # -> service runnerctl-gpu.service
-#     url = "https://github.com/YOUR-ORG"
-#     count = 2
-#     labels = ["self-hosted", "linux", "x64", "gpu", "cuda"]
-#     base_dir = "~/actions-runner"         # sharing base_dir is fine...
-#     dir_prefix = "gpu"                    # ...with a distinct dir_prefix
-#
-# Each pool gets its own supervisor (runnerctl-<name>.service), its own state
-# under <base_dir>/.runnerctl/<name>/, and — for named pools — GitHub-side
-# runner names <host>-<name>-<N>, so pools never collide. Pools may also use
-# entirely separate base_dirs; then dir_prefix can stay "runner".
+# - Runner directories: dir_prefix defaults to the pool name ("main1", "gpu2").
+#   A single anonymous [pool] (no [pool.<name>] tables) is the pool "default"
+#   with dir_prefix "runner" — set dir_prefix = "actions" there to adopt an
+#   existing hand-made actions1..N layout.
+# - GitHub-side names: <name_prefix>-<pool>-<N> ("host-gpu-2"); the pool
+#   "default" uses plain <name_prefix>-<N>.
+# - CLI addressing: `runnerctl stop gpu/2`, `runnerctl logs gpu/2`,
+#   `runnerctl rm gpu` (whole pool), or a bare index in single-pool files.
+# - Preview any mutating command with --dry-run (-n): `runnerctl up -n`.
