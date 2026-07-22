@@ -1,21 +1,23 @@
 # gh-runnerctl
 
-A sudoless, config-driven pool manager for self-hosted GitHub Actions runners.
-One Python file, standard library only, docker-compose-style CLI.
+A sudoless, config-driven pool manager for self-hosted GitHub Actions runners —
+on one machine or a whole fleet over ssh. One Python file, standard library
+only, docker-compose-style CLI.
 
 ```console
 $ runnerctl status
 
-instance default   config=runners.toml   pools: main=4, gpu=2
-supervisor running (pid 71324, systemd)
+instance default   config=runners.toml   pools: head@acclhead1=4, gpu@gpunode=2
+supervisor@acclhead1 running (pid 71324, detached)
+supervisor@gpunode running (pid 4482, systemd)
 
-  POOL  IDX  NAME          RUNNER   GITHUB   JOB
-  main  1    node1-main-1  running  online   idle
-  main  2    node1-main-2  running  online   busy
-  main  3    node1-main-3  running  online   idle
-  main  4    node1-main-4  running  online   idle
-  gpu   1    node1-gpu-1   running  online   idle
-  gpu   2    node1-gpu-2   stopped  online   -
+  POOL           IDX  NAME              RUNNER   GITHUB   JOB
+  head@acclhead1 1    acclhead1-head-1  running  online   idle
+  head@acclhead1 2    acclhead1-head-2  running  online   busy
+  head@acclhead1 3    acclhead1-head-3  running  online   idle
+  head@acclhead1 4    acclhead1-head-4  running  online   idle
+  gpu@gpunode    1    gpunode-gpu-1     running  online   idle
+  gpu@gpunode    2    gpunode-gpu-2     stopped  online   -
 ```
 
 **The config file is the interface.** Declare any number of pools in one
@@ -43,13 +45,19 @@ Every existing multi-runner tool assumes root, Docker, or Kubernetes.
 `runnerctl` targets the host where you have none of those — an HPC login node,
 a shared lab workstation, a locked-down VM:
 
-- **No sudo, ever.** `runnerctl` itself is the one service: a single
-  *user-level* systemd unit (with automatic session linger) runs the
+- **No sudo, ever.** `runnerctl` itself is the one service per machine: a
+  single *user-level* systemd unit (with automatic session linger) runs the
   `runnerctl daemon` supervisor, which owns every runner process of every
   pool as a child and restarts each independently with backoff. On hosts
   where the systemd user bus is disabled, the same supervisor runs as a
   detached process — identical behavior, including per-runner crash restarts.
-- **No dependencies.** One file, Python 3.6+ standard library only.
+- **No dependencies.** One file, Python 3.6+ standard library only. Remote
+  hosts need nothing but passwordless ssh — `up` deploys the script itself.
+- **Your GitHub token never travels.** Auth and all GitHub API work
+  (registration-token minting, busy checks, the status view) happen on the
+  control machine; remote hosts only ever receive short-lived (~1 h,
+  single-purpose) registration/removal tokens, piped over ssh **stdin** —
+  never argv, never a file, never the PAT itself.
 - **No PAT required.** Works best with a token (`GITHUB_TOKEN` or a logged-in
   `gh` CLI), but degrades to an interactive flow that prompts you to paste
   registration tokens from the GitHub settings page.
@@ -86,18 +94,20 @@ queued jobs across the runners automatically.
 `$RUNNERCTL_CONFIG`).
 
 ```toml
-name = "default"          # instance name -> runnerctl-<name>.service
+name = "default"          # instance name
 manager = "auto"          # supervisor hosting: auto | systemd | nohup
 
 [defaults]                # keys shared by every pool
 url = "https://github.com/my-org"
-base_dir = "~/actions-runner"
+base_dir = "~/gh-runners"
 
-[pool.main]
+[pool.head]
+host = "acclhead1"        # ssh alias; omit for this machine
 count = 4
 labels = ["self-hosted", "linux", "x64"]
 
 [pool.gpu]
+host = "gpunode"
 count = 2
 labels = ["self-hosted", "linux", "x64", "gpu"]
 ```
@@ -113,15 +123,41 @@ names are plain `<host>-<N>`.
 | `url` | — | Org URL (`https://github.com/my-org`) or repo URL (`.../owner/repo`) |
 | `count` | `2` | Desired runners in the pool; `up` converges both directions |
 | `labels` | `["self-hosted"]` | Runner labels |
-| `base_dir` | `~/actions-runner` | Runners live in `<base_dir>/<dir_prefix><N>` |
+| `base_dir` | `~/gh-runners` | Runners live in `<base_dir>/<dir_prefix><N>` |
 | `version` | `latest` | Runner release to install, e.g. `"2.335.1"` |
-| `name_prefix` | hostname | GitHub-side names `<prefix>-<pool>-<N>` |
+| `name_prefix` | host / hostname | GitHub-side names `<prefix>-<pool>-<N>` |
 | `group` | — | Runner group (org-level registration only) |
 | `dir_prefix` | pool name | Directory naming; see *Adopting an existing setup* |
+| `host` | — | ssh alias to run this pool on; empty = this machine |
 
 Pool keys go in `[defaults]` (shared) or per `[pool.<name>]` (override).
 Pools may share a `base_dir` (distinct `dir_prefix` enforced) or use separate
 ones — even different orgs/repos per pool.
+
+## Multi-machine
+
+Give a pool a `host` and `runnerctl up` runs it there over passwordless ssh:
+the script deploys **itself** and the config to the host (a tar stream over
+plain ssh — no scp, no pip, nothing to install first), starts a supervisor
+there, and converges the pool. The division of labor is strict:
+
+- **Control machine**: GitHub auth, token minting, busy checks, the `status`
+  view, all decisions.
+- **Remote host**: process supervision only. Its supervisor holds no
+  credentials; registration happens with a pre-minted short-lived token piped
+  over ssh stdin.
+
+`status` aggregates every host (supervisor + per-runner process state) next
+to the GitHub online/busy view; an unreachable host degrades to a marked row,
+never an error. `stop gpu/2`, `logs gpu/2 -f`, `rm gpu`, `down` all route to
+the right machine transparently.
+
+**Shared home directories** (typical clusters) are fully supported:
+supervisor state (`~/.local/state/runnerctl/<name>/<machine>/`) and systemd
+units (`runnerctl-<name>-<machine>.service`, guarded by `ConditionHost=`) are
+scoped per machine, so hosts never fight over pidfiles or start each other's
+supervisors at boot. Keep `dir_prefix` distinct between pools — the default
+(the pool name) already is.
 
 ## Commands
 
@@ -221,6 +257,8 @@ small option for a fixed host.
 - Fixed-size pools — no webhook-driven autoscaling by design.
 - No ephemeral (`--ephemeral`) mode yet.
 - github.com only (no GHES) for now.
+- Remote pools assume passwordless ssh (`BatchMode`); use one alias per host
+  consistently — the alias names the machine's state.
 
 ## License
 

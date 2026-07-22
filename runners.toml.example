@@ -1,23 +1,27 @@
 # runnerctl configuration — the config file IS the interface:
 # edit it, then `runnerctl up` (full converge, does GitHub registration work)
-# or `runnerctl reload` (soft apply to the running supervisor, no GitHub work).
+# or `runnerctl reload` (soft apply to running supervisors, no GitHub work).
 #
-# One file = one supervisor service; it may define any number of pools.
+# One file = one instance; it may define any number of pools, on this machine
+# or on other machines over passwordless ssh. GitHub auth stays on THIS
+# machine: remote hosts only ever receive short-lived registration/removal
+# tokens, piped over ssh stdin.
 
-name = "default"                        # instance name -> runnerctl-<name>.service
-manager = "auto"                        # how the supervisor is hosted: auto | systemd | nohup
+name = "default"                        # instance name -> runnerctl-<name>-<machine>.service
+manager = "auto"                        # how supervisors are hosted: auto | systemd | nohup
 
 [defaults]                              # keys shared by every pool below
 url = "https://github.com/YOUR-ORG"    # org URL (runners serve all repos) or a repo URL
-base_dir = "~/actions-runner"           # runners live in <base_dir>/<dir_prefix><N>
+base_dir = "~/gh-runners"               # runners live in <base_dir>/<dir_prefix><N>
 version = "latest"                      # runner release, e.g. "2.335.1", or "latest"
-name_prefix = ""                        # GitHub-side name prefix; default: this hostname
 
-[pool.main]
+[pool.head]
+host = "acclhead1"                      # ssh alias; "" or omitted = this machine
 count = 4
 labels = ["self-hosted", "linux", "x64"]
 
 [pool.gpu]
+host = "gpunode"
 count = 2
 labels = ["self-hosted", "linux", "x64", "gpu", "cuda"]
 # every [defaults] key can be overridden per pool:
@@ -27,12 +31,19 @@ labels = ["self-hosted", "linux", "x64", "gpu", "cuda"]
 # ---------------------------------------------------------------------------
 # Notes
 #
-# - Runner directories: dir_prefix defaults to the pool name ("main1", "gpu2").
-#   A single anonymous [pool] (no [pool.<name>] tables) is the pool "default"
-#   with dir_prefix "runner" — set dir_prefix = "actions" there to adopt an
-#   existing hand-made actions1..N layout.
-# - GitHub-side names: <name_prefix>-<pool>-<N> ("host-gpu-2"); the pool
-#   "default" uses plain <name_prefix>-<N>.
-# - CLI addressing: `runnerctl stop gpu/2`, `runnerctl logs gpu/2`,
+# - Remote pools: `runnerctl up` copies this script + this config to the host
+#   (over plain ssh, no scp needed) and runs a supervisor there. Your GitHub
+#   token never leaves this machine.
+# - Shared home directories (clusters) are fine: supervisor state and systemd
+#   units are scoped per machine, and units carry ConditionHost so a host
+#   never boots another host's supervisor. Just keep dir_prefix distinct
+#   between pools (the default — the pool name — already is).
+# - Runner directories: dir_prefix defaults to the pool name ("head1",
+#   "gpu2"). A single anonymous [pool] (no [pool.<name>] tables) is the pool
+#   "default" with dir_prefix "runner" — set dir_prefix = "actions" there to
+#   adopt an existing hand-made actions1..N layout.
+# - GitHub-side names: <name_prefix>-<pool>-<N>; name_prefix defaults to the
+#   pool's host alias (or this hostname for local pools).
+# - CLI addressing: `runnerctl stop gpu/2`, `runnerctl logs gpu/2 -f`,
 #   `runnerctl rm gpu` (whole pool), or a bare index in single-pool files.
 # - Preview any mutating command with --dry-run (-n): `runnerctl up -n`.

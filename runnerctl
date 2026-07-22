@@ -3,21 +3,29 @@
 # Single file, Python 3.6+ standard library only.
 # https://github.com/flinner/gh-runnerctl
 #
-# Architecture: ONE supervisor process (`runnerctl daemon`) per config file
-# owns every runner process of every pool in that file as direct children,
-# restarting each independently with backoff. The supervisor is hosted either
-# as a single user-level systemd service (runnerctl-<name>.service) or as a
-# detached process on hosts without a systemd user bus. All GitHub work
-# (registration, busy checks, interactive token prompts) lives in the CLI
-# commands; the daemon needs no tokens and is controlled with SIGHUP (rescan)
-# plus per-runner marker files.
+# Architecture: ONE supervisor process (`runnerctl daemon`) per machine owns
+# every runner process of every pool assigned to that machine as direct
+# children, restarting each independently with backoff. The supervisor is
+# hosted either as a single user-level systemd service
+# (runnerctl-<name>.service) or as a detached process on hosts without a
+# systemd user bus. All GitHub work (registration, busy checks, interactive
+# token prompts) lives in the CLI commands on the CONTROL machine; daemons
+# hold no tokens and are controlled with SIGHUP (rescan) plus per-runner
+# marker files.
+#
+# Multi-machine: a pool may carry `host = "sshalias"`. The control machine
+# deploys this script and the config to the host over ssh, runs commands
+# there with `--as-host`, and pipes short-lived registration/removal tokens
+# over stdin — the GitHub token itself never leaves the control machine.
 
 import argparse
 import getpass
+import io
 import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -30,10 +38,13 @@ import urllib.request
 
 from collections import OrderedDict
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 RAW_SELF_URL = "https://raw.githubusercontent.com/flinner/gh-runnerctl/main/runnerctl"
 
 API_ROOT = "https://api.github.com"
+REMOTE_BASE = "$HOME/.local/share/runnerctl"
+
+AGENT_MODE = False  # set by --agent: invoked over ssh by a control machine
 
 INSTANCE_DEFAULTS = {
     "name": "default",
@@ -44,40 +55,31 @@ POOL_DEFAULTS = {
     "url": "",
     "count": 2,
     "labels": ["self-hosted"],
-    "base_dir": "~/actions-runner",
+    "base_dir": "~/gh-runners",
     "version": "latest",
     "name_prefix": "",
     "group": "",
     "dir_prefix": "",
+    "host": "",
 }
 
 CONFIG_TEMPLATE = '''# runnerctl configuration — `runnerctl up` converges every pool to this file.
-# One file = one supervisor service; it may define any number of pools.
+# One file = one instance; it may define any number of pools, local or remote.
 
 [pool]
 url = "https://github.com/YOUR-ORG"   # org URL (runners serve all repos) or a single repo URL
-count = 4                              # desired number of runners on this host
+count = 4                              # desired number of runners
 labels = ["self-hosted", "linux", "x64"]
-base_dir = "~/actions-runner"          # runners live in <base_dir>/<dir_prefix><N>
+base_dir = "~/gh-runners"              # runners live in <base_dir>/<dir_prefix><N>
 version = "latest"                     # runner release, e.g. "2.335.1", or "latest"
-name_prefix = ""                       # GitHub-side names <prefix>-<N>; default: this hostname
+name_prefix = ""                       # GitHub-side name prefix; default: hostname (or `host`)
 manager = "auto"                       # how the supervisor is hosted: auto | systemd | nohup
 group = ""                             # optional runner group (org-level only)
 dir_prefix = "runner"                  # set "actions" to adopt an existing actions<N> layout
+host = ""                              # ssh alias to run this pool on ("" = this machine)
 
 # For multiple pools, replace [pool] with named tables and share keys in
-# [defaults] — see runners.toml.example:
-#
-#   [defaults]
-#   url = "https://github.com/YOUR-ORG"
-#
-#   [pool.main]
-#   count = 4
-#   labels = ["self-hosted", "linux", "x64"]
-#
-#   [pool.gpu]
-#   count = 2
-#   labels = ["self-hosted", "linux", "x64", "gpu"]
+# [defaults] — see runners.toml.example.
 '''
 
 
@@ -110,6 +112,14 @@ def ok(msg):
 
 def warn(msg):
     print(paint("!!", YELLOW) + " " + msg, file=sys.stderr)
+
+
+def relay(host, out, errout):
+    """Show a remote command's output, tagged with its host."""
+    for line in out.strip().splitlines():
+        print("  " + paint("[{}]".format(host), DIM) + " " + line)
+    for line in errout.strip().splitlines():
+        print("  " + paint("[{}]".format(host), DIM) + " " + line, file=sys.stderr)
 
 
 def run(cmd, cwd=None, check=False):
@@ -225,6 +235,7 @@ class Instance:
         self.name = name
         self.manager = manager
         self.path = path
+        self.as_host = None
         self.pools = OrderedDict()
 
     @property
@@ -233,6 +244,16 @@ class Instance:
 
     def only_pool(self):
         return next(iter(self.pools.values()))
+
+    def local_pools(self):
+        return [p for p in self.pools.values() if not p.host]
+
+    def remote_hosts(self):
+        out = OrderedDict()
+        for p in self.pools.values():
+            if p.host:
+                out.setdefault(p.host, []).append(p)
+        return out
 
 
 def find_config(explicit):
@@ -266,6 +287,12 @@ def api_scope(url):
 
 
 _NAME_RE = re.compile(r"[A-Za-z0-9_-]+$")
+
+
+def _finalize_local_paths(data):
+    # only meaningful on the machine the pool actually runs on: "~" must
+    # expand with THAT machine's home, so remote pools keep the raw string
+    data["base_dir"] = os.path.abspath(os.path.expanduser(str(data["base_dir"])))
 
 
 def load_config(path):
@@ -340,18 +367,48 @@ def load_config(path):
             data["labels"] = [data["labels"]]
         if not data["labels"] or not all(isinstance(x, str) for x in data["labels"]):
             raise Err("{}: {}: labels must be a non-empty list of strings".format(path, where))
-        data["base_dir"] = os.path.abspath(os.path.expanduser(str(data["base_dir"])))
+        data["host"] = str(data["host"]).strip()
         data["version"] = str(data["version"])
         if not data["name_prefix"]:
-            data["name_prefix"] = hostname
+            # remote pools default to the host alias so both the control
+            # machine and the remote agent derive identical runner names
+            data["name_prefix"] = data["host"] or hostname
         if not data["dir_prefix"]:
             data["dir_prefix"] = "runner" if pname == "default" else pname
-        key = (data["base_dir"], data["dir_prefix"])
+        if not data["host"]:
+            _finalize_local_paths(data)
+        key = (data["host"], str(data["base_dir"]), data["dir_prefix"])
         if key in seen_dirs:
             raise Err("{}: pools {!r} and {!r} share base_dir {} with the same "
-                      "dir_prefix {!r}".format(path, seen_dirs[key], pname, key[0], key[1]))
+                      "dir_prefix {!r} on the same host".format(
+                          path, seen_dirs[key], pname, key[1], key[2]))
+        crosshost = (str(data["base_dir"]), data["dir_prefix"])
+        for (h, b, d), other in list(seen_dirs.items()):
+            if h != data["host"] and (b, d) == crosshost:
+                warn("{}: pools {!r} ({}) and {!r} ({}) use the same base_dir "
+                     "and dir_prefix on different hosts — if those hosts share "
+                     "a home directory, give each pool a distinct dir_prefix".format(
+                         path, other, h or "local", pname, data["host"] or "local"))
         seen_dirs[key] = pname
         inst.pools[pname] = Pool(data, pname, inst)
+    return inst
+
+
+def scope_instance(inst, host):
+    """--as-host: keep only pools assigned to `host` and treat them as local
+    (this process IS that host). Used by remote agents and their daemons."""
+    scoped = OrderedDict()
+    for name, p in inst.pools.items():
+        if p.host == host:
+            p.host = ""
+            data = {"base_dir": p.base_dir}
+            _finalize_local_paths(data)
+            p.base_dir = data["base_dir"]
+            scoped[name] = p
+    if not scoped:
+        raise Err("no pools assigned to host {!r} in {}".format(host, inst.path))
+    inst.pools = scoped
+    inst.as_host = host
     return inst
 
 
@@ -403,15 +460,18 @@ def api(method, path, token, body=None):
 
 
 class GitHub:
-    """Token acquisition ladder: GITHUB_TOKEN/GH_TOKEN -> gh CLI -> interactive
+    """Token acquisition ladder: pre-supplied tokens (piped over ssh stdin by
+    a control machine) -> GITHUB_TOKEN/GH_TOKEN -> gh CLI -> interactive
     prompt. With an API token, registration/removal tokens are minted
-    automatically and remote runner status is available. Without one, the user
-    is prompted to paste tokens from the GitHub settings pages (valid ~1h,
-    reused within the run) and remote status/busy checks are unavailable."""
+    automatically and remote runner status is available. Pre-supplied tokens
+    allow a remote agent to register/deregister without ever seeing the
+    GitHub token itself."""
 
     def __init__(self, pool):
         self.pool = pool
         self.scope = api_scope(pool.url)
+        self.env_reg = os.environ.get("RUNNERCTL_REG_TOKEN") or None
+        self.env_rem = os.environ.get("RUNNERCTL_REM_TOKEN") or None
         self.token = get_token()
         self._reg = None
         self._rem = None
@@ -424,6 +484,8 @@ class GitHub:
         return self.token is None
 
     def warn_manual(self, what):
+        if AGENT_MODE or self.env_reg or self.env_rem:
+            return  # the control machine already handled/checked this
         if not self._warned:
             warn("no GitHub token (GITHUB_TOKEN / `gh auth login`): {}".format(what))
             self._warned = True
@@ -462,6 +524,10 @@ class GitHub:
         return value, (value, good_until)
 
     def reg_token(self, refresh=False):
+        if self.env_reg:
+            if refresh:
+                raise Err("the supplied registration token was rejected")
+            return self.env_reg
         if self.manual:
             if self._reg is None or refresh:
                 self._reg = self._prompt("registration", self._settings_page() + "/new")
@@ -470,6 +536,10 @@ class GitHub:
         return token
 
     def rem_token(self, refresh=False):
+        if self.env_rem:
+            if refresh:
+                raise Err("the supplied removal token was rejected")
+            return self.env_rem
         if self.manual:
             if self._rem is None or refresh:
                 self._rem = self._prompt("removal", self._settings_page())
@@ -497,16 +567,167 @@ class GitHub:
         api("DELETE", "{}/actions/runners/{}".format(self.scope, runner_id), self.token)
 
 
+class GitHubSessions:
+    """One GitHub session per pool, one remote listing per distinct scope."""
+
+    def __init__(self):
+        self._by_pool = {}
+        self._remote_by_scope = {}
+
+    def for_pool(self, pool):
+        if pool.name not in self._by_pool:
+            self._by_pool[pool.name] = GitHub(pool)
+        return self._by_pool[pool.name]
+
+    def remote(self, pool):
+        gh = self.for_pool(pool)
+        if gh.scope not in self._remote_by_scope:
+            self._remote_by_scope[gh.scope] = gh.runners()
+        return self._remote_by_scope[gh.scope]
+
+    def busy(self, pool, purpose):
+        gh = self.for_pool(pool)
+        if gh.manual:
+            gh.warn_manual("cannot check busy state before {}".format(purpose))
+            return {}
+        try:
+            return {n: e for n, e in self.remote(pool).items() if e.get("busy")}
+        except Err as e:
+            warn(str(e))
+            return {}
+
+
+# ---------------------------------------------------------------- ssh transport
+
+class RemoteHost:
+    """Drives one ssh host: deploys this script + the config (a single tar
+    stream over ssh, no scp), invokes remote runnerctl with --as-host, and
+    pipes short-lived tokens over stdin so nothing secret hits argv or disk."""
+
+    def __init__(self, host):
+        self.host = host
+        self._deployed = False
+        self._state = None
+
+    def _paths(self, inst):
+        return (REMOTE_BASE + "/runnerctl",
+                REMOTE_BASE + "/{}.toml".format(inst.name))
+
+    def _ssh(self, remote_cmd, stdin_bytes=None, timeout=600):
+        try:
+            return subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", self.host, "--", remote_cmd],
+                input=stdin_bytes, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise Err("ssh to {} timed out".format(self.host))
+        except FileNotFoundError:
+            raise Err("ssh not found on this machine")
+
+    def deploy(self, inst):
+        if self._deployed:
+            return
+        script_path = os.path.realpath(os.path.abspath(sys.argv[0]))
+        with open(script_path, "rb") as f:
+            script = f.read()
+        with open(inst.path, "rb") as f:
+            conf = f.read()
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tf:
+            for name, data, mode in (("runnerctl", script, 0o755),
+                                     ("{}.toml".format(inst.name), conf, 0o644)):
+                ti = tarfile.TarInfo(name)
+                ti.size = len(data)
+                ti.mode = mode
+                ti.mtime = int(time.time())
+                tf.addfile(ti, io.BytesIO(data))
+        cmd = 'mkdir -p "{0}" && tar -xf - -C "{0}"'.format(REMOTE_BASE)
+        p = self._ssh(cmd, stdin_bytes=buf.getvalue(), timeout=60)
+        if p.returncode != 0:
+            raise Err("deploy to {} failed: {}".format(
+                self.host, (p.stderr or b"").decode("utf-8", "replace").strip()))
+        self._deployed = True
+
+    def invoke(self, inst, args, tokens=None, deploy=True):
+        """Run remote runnerctl. `args` may start with extra global flags
+        (e.g. --only). tokens = (reg, rem) piped via stdin, never argv."""
+        if deploy:
+            self.deploy(inst)
+        script, conf = self._paths(inst)
+        argv = ['"{}"'.format(script), "-c", '"{}"'.format(conf),
+                "--as-host", shlex.quote(self.host), "--agent"]
+        stdin = None
+        if tokens is not None:
+            argv.append("--tokens-stdin")
+            stdin = "{}\n{}\n".format(tokens[0] or "", tokens[1] or "").encode()
+        argv += [shlex.quote(str(a)) for a in args]
+        p = self._ssh(" ".join(argv), stdin_bytes=stdin)
+        out = (p.stdout or b"").decode("utf-8", "replace")
+        errout = (p.stderr or b"").decode("utf-8", "replace")
+        if p.returncode == 255:
+            raise Err("ssh to {} failed: {}".format(
+                self.host, errout.strip() or "connection error"))
+        return p.returncode, out, errout
+
+    def state(self, inst, deploy=True):
+        """Fetch daemon + runner state as JSON from the remote agent."""
+        if self._state is not None:
+            return self._state
+        rc, out, errout = self.invoke(inst, ["agent-status"], deploy=deploy)
+        if rc == 127:
+            raise Err("runnerctl is not deployed on {} yet "
+                      "(`runnerctl up` deploys it)".format(self.host))
+        if rc != 0:
+            raise Err("agent-status on {} failed: {}".format(
+                self.host, (errout or out).strip()))
+        try:
+            self._state = json.loads(out.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            raise Err("agent-status on {} returned garbage: {!r}".format(
+                self.host, out[:200]))
+        return self._state
+
+
+def remote_hosts_for(inst):
+    return OrderedDict((h, RemoteHost(h)) for h in inst.remote_hosts())
+
+
+def pool_indices_map(inst, rhosts):
+    """pool name -> sorted registered indices (None if its host is
+    unreachable). The oracle for CLI ref expansion and validation."""
+    out = {}
+    for pool in inst.pools.values():
+        if not pool.host:
+            out[pool.name] = [i for i in local_indices(pool) if registered_name(pool, i)]
+            continue
+        try:
+            st = rhosts[pool.host].state(inst, deploy=False)
+            pl = st.get("pools", {}).get(pool.name, {})
+            out[pool.name] = sorted(int(k) for k, v in pl.items() if v.get("name"))
+        except Err:
+            out[pool.name] = None
+    return out
+
+
 # ---------------------------------------------------------------- local pool state
 
 def runner_dir(pool, i):
     return os.path.join(pool.base_dir, "{}{}".format(pool.dir_prefix, i))
 
 
+def machine_id(inst):
+    """This machine's identity for state/unit scoping: the --as-host alias on
+    a remote agent, the local hostname on the control machine. Keeps clusters
+    with SHARED home directories safe — every machine gets its own state and
+    unit even though they see the same files."""
+    return inst.as_host or socket.gethostname().split(".")[0]
+
+
 def state_dir(inst):
-    # instance-wide (pools may use different base_dirs), XDG state home
+    # scoped per instance AND per machine: on shared-home clusters several
+    # supervisors (one per host) coexist under one physical ~/.local/state
     root = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
-    return os.path.join(root, "runnerctl", inst.name)
+    return os.path.join(root, "runnerctl", inst.name, machine_id(inst))
 
 
 def daemon_pidfile(inst):
@@ -591,7 +812,7 @@ def local_indices(pool):
 
 
 def default_name(pool, i):
-    # the default pool keeps plain <host>-<N> names (adoption-friendly);
+    # the default pool keeps plain <prefix>-<N> names (adoption-friendly);
     # named pools include the pool name to avoid cross-pool collisions
     if pool.name == "default":
         return "{}-{}".format(pool.name_prefix, i)
@@ -604,13 +825,16 @@ def runner_ref(pool, i):
     return "{}/{}".format(pool.name, i)
 
 
-def resolve_refs(inst, tokens, default_all=True):
+def resolve_refs(inst, tokens, indices_map, default_all=True):
     """CLI runner addressing -> ordered [(pool, idx)]. Token forms:
     '3' (single-pool file), 'gpu' (whole pool), 'gpu/3'."""
     out = []
 
     def add_pool(pool):
-        idxs = [i for i in local_indices(pool) if registered_name(pool, i)]
+        idxs = indices_map.get(pool.name)
+        if idxs is None:
+            raise Err("cannot enumerate pool {!r}: host {} is unreachable".format(
+                pool.name, pool.host))
         out.extend((pool, i) for i in idxs)
 
     if not tokens:
@@ -685,10 +909,10 @@ def ensure_tarball(pool, version):
 # ---------------------------------------------------------------- supervisor daemon
 
 class Supervisor:
-    """The `runnerctl daemon` runtime: owns every runner process of every pool
-    as a direct child, restarts each independently with exponential backoff,
-    and re-reads desired state (registered runner dirs minus disabled markers)
-    on SIGHUP. Holds no GitHub credentials and performs no registration work."""
+    """The `runnerctl daemon` runtime: owns every runner process of every
+    LOCAL pool as a direct child, restarts each independently with exponential
+    backoff, and re-reads the config file on SIGHUP. Holds no GitHub
+    credentials and performs no registration work."""
 
     POLL = 1.0
     QUICK_DEATH = 60.0
@@ -709,6 +933,8 @@ class Supervisor:
     def desired(self):
         out = OrderedDict()
         for pool in self.inst.pools.values():
+            if pool.host:
+                continue  # another machine's pool
             for i in local_indices(pool):
                 d = runner_dir(pool, i)
                 if not os.path.isfile(os.path.join(d, "run.sh")):
@@ -719,6 +945,25 @@ class Supervisor:
                     continue
                 out[(pool.name, i)] = pool
         return out
+
+    def reload_config(self):
+        """SIGHUP: re-read the config file so pool/count edits apply live.
+        The instance name is pinned at start (it names the unit and state
+        dir); a parse failure keeps the previous config."""
+        try:
+            fresh = load_config(self.inst.path)
+            if self.inst.as_host:
+                scope_instance(fresh, self.inst.as_host)
+        except Err as e:
+            self.log("config reload FAILED, keeping previous config: {}".format(e))
+            return
+        if fresh.name != self.inst.name:
+            self.log("config renamed instance {!r} -> {!r}; ignoring the rename "
+                     "(restart the supervisor to apply it)".format(
+                         self.inst.name, fresh.name))
+            fresh.name = self.inst.name
+        self.inst = fresh
+        self.log("config reloaded (pools: {})".format(", ".join(self.inst.pools)))
 
     def spawn(self, pool, i):
         key = (pool.name, i)
@@ -757,23 +1002,6 @@ class Supervisor:
             os.remove(child_pidfile(pool, key[1]))
         except OSError:
             pass
-
-    def reload_config(self):
-        """SIGHUP: re-read the config file so pool/count edits apply live.
-        The instance name is pinned at start (it names the unit and state
-        dir); a parse failure keeps the previous config."""
-        try:
-            fresh = load_config(self.inst.path)
-        except Err as e:
-            self.log("config reload FAILED, keeping previous config: {}".format(e))
-            return
-        if fresh.name != self.inst.name:
-            self.log("config renamed instance {!r} -> {!r}; ignoring the rename "
-                     "(restart the supervisor to apply it)".format(
-                         self.inst.name, fresh.name))
-            fresh.name = self.inst.name
-        self.inst = fresh
-        self.log("config reloaded (pools: {})".format(", ".join(self.inst.pools)))
 
     def reap(self):
         for key, (pool, p) in list(self.children.items()):
@@ -849,7 +1077,9 @@ def systemd_user_available():
 
 
 def unit_name(inst):
-    return "runnerctl-{}.service".format(inst.name)
+    # per-machine name: on shared-home clusters every host sees the same
+    # ~/.config/systemd/user, so units must not overwrite each other
+    return "runnerctl-{}-{}.service".format(inst.name, machine_id(inst))
 
 
 def unit_path(inst):
@@ -857,9 +1087,9 @@ def unit_path(inst):
 
 
 class DaemonController:
-    """Hosts and signals the supervisor: one user-level systemd service when a
-    user bus exists, otherwise a detached process (survives logout via its own
-    session; not resurrected after reboot)."""
+    """Hosts and signals the local supervisor: one user-level systemd service
+    when a user bus exists, otherwise a detached process (survives logout via
+    its own session; not resurrected after reboot)."""
 
     def __init__(self, inst, announce=False):
         self.inst = inst
@@ -886,15 +1116,26 @@ class DaemonController:
     def _script(self):
         return os.path.realpath(os.path.abspath(sys.argv[0]))
 
+    def _scope_args(self):
+        if self.inst.as_host:
+            return ["--as-host", self.inst.as_host]
+        return []
+
     def _unit_body(self):
+        scope = ""
+        if self.inst.as_host:
+            scope = " --as-host {}".format(self.inst.as_host)
         return (
             "# managed by runnerctl\n"
             "[Unit]\n"
             "Description=runnerctl - GitHub Actions runner pool supervisor ({name})\n"
             "After=network-online.target\n"
+            # shared-home clusters: enable symlinks are visible to every
+            # machine, so each unit must refuse to start anywhere but home
+            "ConditionHost={chost}\n"
             "\n"
             "[Service]\n"
-            "ExecStart={script} -c {config} daemon\n"
+            "ExecStart={script} -c {config}{scope} daemon\n"
             "ExecReload=/bin/kill -HUP $MAINPID\n"
             "Restart=always\n"
             "RestartSec=5\n"
@@ -904,7 +1145,8 @@ class DaemonController:
             "[Install]\n"
             "WantedBy=default.target\n"
         ).format(name=self.inst.name, script=self._script(),
-                 config=os.path.realpath(self.inst.path))
+                 config=os.path.realpath(self.inst.path), scope=scope,
+                 chost=socket.gethostname().split(".")[0])
 
     def _unit_active(self):
         p = run(["systemctl", "--user", "is-active", unit_name(self.inst)])
@@ -955,7 +1197,8 @@ class DaemonController:
                 return
             with open(daemon_logfile(self.inst), "ab") as logf:
                 subprocess.Popen(
-                    [self._script(), "-c", os.path.realpath(self.inst.path), "daemon"],
+                    [self._script(), "-c", os.path.realpath(self.inst.path)]
+                    + self._scope_args() + ["daemon"],
                     stdout=logf, stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL, start_new_session=True)
             self._wait_running()
@@ -1005,8 +1248,8 @@ def wait_child_gone(pool, i, timeout=90):
 
 
 def stop_runner_process(pool, dc, i, disable=True):
-    """Stop one runner: mark it disabled so the supervisor will not respawn it,
-    let the supervisor bring it down, fall back to killing directly."""
+    """Stop one LOCAL runner: mark it disabled so the supervisor will not
+    respawn it, let the supervisor bring it down, fall back to killing."""
     if disable:
         os.makedirs(os.path.dirname(disabled_marker(pool, i)), exist_ok=True)
         with open(disabled_marker(pool, i), "w"):
@@ -1069,7 +1312,7 @@ def provision(pool, i, gh, tarball):
         if p.returncode == 0:
             break
         detail = (p.stdout or "").strip()
-        if gh.manual:
+        if gh.manual and not gh.env_reg:
             warn("config.sh failed for {}:\n{}".format(name, detail))
             info("the pasted token may be expired or spent; provide a fresh one")
             refresh = True
@@ -1093,7 +1336,7 @@ def decommission(pool, i, gh, dc, remote, force):
             p = run([os.path.join(d, "config.sh"), "remove", "--token", rem], cwd=d)
             if p.returncode == 0:
                 break
-            if gh.manual:
+            if gh.manual and not gh.env_rem:
                 warn("config.sh remove failed for {}:\n{}".format(
                     name, (p.stdout or "").strip()))
                 info("the pasted token may be expired; provide a fresh one")
@@ -1114,36 +1357,6 @@ def decommission(pool, i, gh, dc, remote, force):
         pass
     ok("removed runner {} ({})".format(runner_ref(pool, i), name))
     return True
-
-
-class GitHubSessions:
-    """One GitHub session per pool, one remote listing per distinct scope."""
-
-    def __init__(self):
-        self._by_pool = {}
-        self._remote_by_scope = {}
-
-    def for_pool(self, pool):
-        if pool.name not in self._by_pool:
-            self._by_pool[pool.name] = GitHub(pool)
-        return self._by_pool[pool.name]
-
-    def remote(self, pool):
-        gh = self.for_pool(pool)
-        if gh.scope not in self._remote_by_scope:
-            self._remote_by_scope[gh.scope] = gh.runners()
-        return self._remote_by_scope[gh.scope]
-
-    def busy(self, pool, purpose):
-        gh = self.for_pool(pool)
-        if gh.manual:
-            gh.warn_manual("cannot check busy state before {}".format(purpose))
-            return {}
-        try:
-            return {n: e for n, e in self.remote(pool).items() if e.get("busy")}
-        except Err as e:
-            warn(str(e))
-            return {}
 
 
 # ---------------------------------------------------------------- commands
@@ -1221,54 +1434,15 @@ def cmd_update():
             pass
         raise Err("cannot install update to {}: {}".format(path, e))
     ok("updated v{} -> v{} ({})".format(VERSION, remote, path))
-    info("running supervisors keep the old code until you `runnerctl reload` "
-         "after a supervisor restart, or `runnerctl down && runnerctl up`")
+    info("remote hosts pick the new copy up on the next deploying command; "
+         "supervisors keep old code until restarted (`down` + `up`)")
 
 
-def cmd_up(inst, force=False, dry=False):
-    sessions = GitHubSessions()
-    dc = DaemonController(inst, announce=not dry)
-    if dry:
-        print(paint("plan", BOLD) + " for instance {} ({}):".format(inst.name, inst.path))
-        acts = 0
-        for pool in inst.pools.values():
-            gh = sessions.for_pool(pool)
-            target = pool.count
-            for i in range(1, target + 1):
-                if not registered_name(pool, i):
-                    plan_line("+", "register runner {} as {} ({})".format(
-                        runner_ref(pool, i), default_name(pool, i), pool.url))
-                    acts += 1
-                elif os.path.exists(disabled_marker(pool, i)):
-                    plan_line("~", "clear stopped mark on runner {}".format(
-                        runner_ref(pool, i)))
-                    acts += 1
-            for i in sorted((j for j in local_indices(pool) if j > target), reverse=True):
-                name = registered_name(pool, i) or default_name(pool, i)
-                if gh.manual:
-                    state = "busy state unknown"
-                else:
-                    try:
-                        entry = sessions.remote(pool).get(name)
-                    except Err:
-                        entry = None
-                    state = "busy" if entry and entry.get("busy") else "idle"
-                if state == "busy" and not force:
-                    plan_line("!", "keep runner {} ({}) — busy; --force would "
-                                   "prune it".format(runner_ref(pool, i), name))
-                else:
-                    plan_line("-", "deregister and delete runner {} ({}, {})".format(
-                        runner_ref(pool, i), name, state))
-                acts += 1
-        if dc.running():
-            plan_line("*", "reload supervisor (SIGHUP pid {})".format(dc.pid()))
-        else:
-            plan_line("*", "start supervisor ({})".format(
-                unit_name(inst) if dc.mode == "systemd" else "detached"))
-        plan_done(acts + 1)
-        return
+# ---------------------------------------------------------------- up / reload
+
+def _up_local(inst, sessions, dc, force, no_prune):
     total = 0
-    for pool in inst.pools.values():
+    for pool in inst.local_pools():
         gh = sessions.for_pool(pool)
         target = pool.count
         tarball = None
@@ -1278,41 +1452,185 @@ def cmd_up(inst, force=False, dry=False):
                     tarball = ensure_tarball(pool, resolve_version(pool, gh))
                 provision(pool, i, gh, tarball)
             enable_runner(pool, i)  # up means: everything in range runs
-        extra = [i for i in local_indices(pool) if i > target]
-        if extra:
-            if gh.manual:
-                gh.warn_manual("cannot check busy state; surplus runners are "
-                               "removed as-is")
-            remote = sessions.remote(pool)
-            for i in sorted(extra, reverse=True):
-                decommission(pool, i, gh, dc, remote, force)
+        if not no_prune:
+            extra = [i for i in local_indices(pool) if i > target]
+            if extra:
+                if gh.manual:
+                    gh.warn_manual("cannot check busy state; surplus runners are "
+                                   "removed as-is")
+                remote = sessions.remote(pool) if not gh.manual else {}
+                for i in sorted(extra, reverse=True):
+                    decommission(pool, i, gh, dc, remote, force)
         total += target
-    if total > 0 or dc.running():
+    if dc and (total > 0 or dc.running()):
         dc.reload_or_start()
+
+
+def _up_remote(inst, sessions, rhosts, force):
+    for host, pools in inst.remote_hosts().items():
+        rh = rhosts[host]
+        info("converging {} pool(s) on {}".format(len(pools), host))
+        try:
+            st = rh.state(inst)  # deploys script + config first
+        except Err as e:
+            warn(str(e))
+            continue
+        for pool in pools:
+            gh = sessions.for_pool(pool)
+            pl = st.get("pools", {}).get(pool.name, {})
+            missing = [i for i in range(1, pool.count + 1)
+                       if not (pl.get(str(i)) or {}).get("name")]
+            surplus = sorted((int(k) for k in pl if int(k) > pool.count), reverse=True)
+            prune = []
+            for i in surplus:
+                name = (pl.get(str(i)) or {}).get("name") or default_name(pool, i)
+                if not force and name in sessions.busy(pool, "pruning surplus runners"):
+                    warn("{} is running a job; skipped (re-run with --force)".format(name))
+                else:
+                    prune.append(i)
+            tokens = (gh.reg_token(), None) if missing else None
+            rc, out, errout = rh.invoke(
+                inst, ["--only", pool.name, "up", "--no-prune"]
+                      + (["--force"] if force else []),
+                tokens=tokens)
+            relay(host, out, errout)
+            if rc != 0:
+                warn("up for pool {!r} on {} failed".format(pool.name, host))
+                continue
+            if prune:
+                rc, out, errout = rh.invoke(
+                    inst, ["--only", pool.name, "rm"]
+                          + [str(i) for i in prune] + ["--force"],
+                    tokens=(None, gh.rem_token()))
+                relay(host, out, errout)
+                if rc != 0:
+                    warn("pruning pool {!r} on {} failed".format(pool.name, host))
+
+
+def _plan_up(inst, sessions, dc, rhosts, force):
+    print(paint("plan", BOLD) + " for instance {} ({}):".format(inst.name, inst.path))
+    acts = 0
+    for pool in inst.local_pools():
+        gh = sessions.for_pool(pool)
+        for i in range(1, pool.count + 1):
+            if not registered_name(pool, i):
+                plan_line("+", "register runner {} as {} ({})".format(
+                    runner_ref(pool, i), default_name(pool, i), pool.url))
+                acts += 1
+            elif os.path.exists(disabled_marker(pool, i)):
+                plan_line("~", "clear stopped mark on runner {}".format(
+                    runner_ref(pool, i)))
+                acts += 1
+        for i in sorted((j for j in local_indices(pool) if j > pool.count), reverse=True):
+            name = registered_name(pool, i) or default_name(pool, i)
+            if gh.manual:
+                state = "busy state unknown"
+            else:
+                try:
+                    entry = sessions.remote(pool).get(name)
+                except Err:
+                    entry = None
+                state = "busy" if entry and entry.get("busy") else "idle"
+            if state == "busy" and not force:
+                plan_line("!", "keep runner {} ({}) — busy; --force would prune "
+                               "it".format(runner_ref(pool, i), name))
+            else:
+                plan_line("-", "deregister and delete runner {} ({}, {})".format(
+                    runner_ref(pool, i), name, state))
+            acts += 1
+    if dc:
+        if dc.running():
+            plan_line("*", "reload supervisor (SIGHUP pid {})".format(dc.pid()))
+        else:
+            plan_line("*", "start supervisor ({})".format(
+                unit_name(inst) if dc.mode == "systemd" else "detached"))
+        acts += 1
+    for host, pools in inst.remote_hosts().items():
+        rh = rhosts[host]
+        try:
+            st = rh.state(inst, deploy=False)
+        except Err as e:
+            plan_line("!", "{}: {} — up would deploy runnerctl and converge "
+                           "there".format(host, e))
+            acts += 1
+            continue
+        for pool in pools:
+            pl = st.get("pools", {}).get(pool.name, {})
+            for i in range(1, pool.count + 1):
+                ent = pl.get(str(i)) or {}
+                if not ent.get("name"):
+                    plan_line("+", "register runner {}/{} on {} as {}".format(
+                        pool.name, i, host, default_name(pool, i)))
+                    acts += 1
+                elif ent.get("state") == "stopped":
+                    plan_line("~", "clear stopped mark on {}/{} ({})".format(
+                        pool.name, i, host))
+                    acts += 1
+            for i in sorted((int(k) for k in pl if int(k) > pool.count), reverse=True):
+                name = (pl.get(str(i)) or {}).get("name") or default_name(pool, i)
+                if name in sessions.busy(pool, "pruning") and not force:
+                    plan_line("!", "keep {}/{} on {} ({}) — busy; --force would "
+                                   "prune it".format(pool.name, i, host, name))
+                else:
+                    plan_line("-", "deregister and delete {}/{} on {} ({})".format(
+                        pool.name, i, host, name))
+                acts += 1
+        d = st.get("daemon", {})
+        if d.get("running"):
+            plan_line("*", "reload supervisor on {} (SIGHUP pid {})".format(
+                host, d.get("pid")))
+        else:
+            plan_line("*", "start supervisor on {}".format(host))
+        acts += 1
+    plan_done(acts)
+
+
+def cmd_up(inst, force=False, dry=False, no_prune=False):
+    sessions = GitHubSessions()
+    rhosts = remote_hosts_for(inst)
+    dc = DaemonController(inst, announce=not dry) if inst.local_pools() else None
+    if dry:
+        _plan_up(inst, sessions, dc, rhosts, force)
+        return
+    _up_local(inst, sessions, dc, force, no_prune)
+    _up_remote(inst, sessions, rhosts, force)
     ok("converged: {}".format(", ".join(
-        "{}={}".format(p.name, p.count) for p in inst.pools.values())))
-    cmd_status(inst)
+        "{}{}={}".format(p.name, "@" + p.host if p.host else "", p.count)
+        for p in inst.pools.values())))
+    if not AGENT_MODE:
+        cmd_status(inst)
 
 
 def cmd_reload(inst):
-    """Soft apply: (re)start the supervisor if needed and make it re-read the
-    config file. No registration work — for count/pool edits that only need
-    supervision changes; `up` additionally registers and prunes."""
-    dc = DaemonController(inst, announce=True)
-    was_running = dc.running()
-    dc.reload_or_start()
-    ok("supervisor {} from {}".format(
-        "reloaded" if was_running else "started", inst.path))
+    """Soft apply: (re)start supervisors and make them re-read the config.
+    No registration work — `up` additionally registers and prunes."""
+    if inst.local_pools():
+        dc = DaemonController(inst, announce=True)
+        was = dc.running()
+        dc.reload_or_start()
+        ok("local supervisor {}".format("reloaded" if was else "started"))
+    for host, _pools in inst.remote_hosts().items():
+        rh = RemoteHost(host)
+        try:
+            rc, out, errout = rh.invoke(inst, ["reload"])
+            relay(host, out, errout)
+            if rc != 0:
+                warn("reload on {} failed".format(host))
+        except Err as e:
+            warn(str(e))
 
+
+# ---------------------------------------------------------------- down / rm / svc
 
 def cmd_down(inst, force=False, dry=False):
-    dc = DaemonController(inst)
+    rhosts = remote_hosts_for(inst)
+    dc = DaemonController(inst) if inst.local_pools() else None
+    sessions = GitHubSessions()
     if dry:
         print(paint("plan", BOLD) + " for instance {} ({}):".format(inst.name, inst.path))
         acts = 0
-        if dc.running():
-            sessions = GitHubSessions()
-            for pool in inst.pools.values():
+        if dc and dc.running():
+            for pool in inst.local_pools():
                 busy = sessions.busy(pool, "stopping the pool")
                 for i in local_indices(pool):
                     if runner_state(pool, i, True) != "running":
@@ -1327,41 +1645,62 @@ def cmd_down(inst, force=False, dry=False):
                     acts += 1
             plan_line("*", "stop supervisor (pid {}, {})".format(dc.pid(), dc.mode))
             acts += 1
+        for host in rhosts:
+            plan_line("*", "stop supervisor and runners on {}".format(host))
+            acts += 1
         plan_done(acts)
         return
-    if not dc.running() and dc.mode == "detached":
-        ok("supervisor already stopped")
-        return
+    blockers = []
     if not force:
-        sessions = GitHubSessions()
-        blockers = []
         for pool in inst.pools.values():
             busy = sessions.busy(pool, "stopping the pool")
-            blockers += [n for i in local_indices(pool)
-                         for n in [registered_name(pool, i)] if n and n in busy]
-        if blockers:
-            raise Err("busy runner(s): {} — retry with --force to kill their "
-                      "jobs, or wait".format(", ".join(blockers)))
-    dc.stop()
-    ok("supervisor stopped; registrations kept (`runnerctl up` resumes)")
+            blockers += [n for n in busy
+                         if n.startswith(pool.name_prefix + "-")]
+    if blockers:
+        raise Err("busy runner(s): {} — retry with --force to kill their "
+                  "jobs, or wait".format(", ".join(sorted(set(blockers)))))
+    if dc:
+        dc.stop()
+        ok("local supervisor stopped")
+    for host, _pools in rhosts.items():
+        try:
+            rc, out, errout = rhosts[host].invoke(inst, ["down", "--force"])
+            relay(host, out, errout)
+            if rc != 0:
+                warn("down on {} failed".format(host))
+        except Err as e:
+            warn(str(e))
+    ok("registrations kept (`runnerctl up` resumes)")
 
 
 def cmd_rm(inst, tokens, all_flag, force, dry=False):
-    refs = resolve_refs(inst, [] if all_flag else tokens, default_all=all_flag)
+    rhosts = remote_hosts_for(inst)
+    imap = pool_indices_map(inst, rhosts)
+    refs = resolve_refs(inst, [] if all_flag else tokens, imap, default_all=all_flag)
     if not refs:
         raise Err("nothing to remove: pass runners (idx, <pool>/<idx>, or a "
                   "pool name) or --all")
-    bad = [runner_ref(p, i) for p, i in refs if i not in local_indices(p)]
+    bad = []
+    for pool, i in refs:
+        known = imap.get(pool.name)
+        if not pool.host:
+            if i not in local_indices(pool):
+                bad.append(runner_ref(pool, i))
+        elif known is not None and i not in known:
+            bad.append("{}/{} (on {})".format(pool.name, i, pool.host))
     if bad:
         raise Err("no such runner(s): {}".format(", ".join(bad)))
     sessions = GitHubSessions()
-    dc = DaemonController(inst)
+    dc = DaemonController(inst) if inst.local_pools() else None
     if dry:
         print(paint("plan", BOLD) + " for instance {} ({}):".format(inst.name, inst.path))
         acts = 0
         for pool, i in sorted(refs, key=lambda r: (r[0].name, r[1])):
             gh = sessions.for_pool(pool)
-            name = registered_name(pool, i) or default_name(pool, i)
+            at = " on " + pool.host if pool.host else ""
+            name = default_name(pool, i)
+            if not pool.host:
+                name = registered_name(pool, i) or name
             if gh.manual:
                 state = "busy state unknown"
             else:
@@ -1371,24 +1710,54 @@ def cmd_rm(inst, tokens, all_flag, force, dry=False):
                     entry = None
                 state = "busy" if entry and entry.get("busy") else "idle"
             if state == "busy" and not force:
-                plan_line("!", "keep runner {} ({}) — busy; --force would remove "
-                               "it".format(runner_ref(pool, i), name))
+                plan_line("!", "keep runner {}{} ({}) — busy; --force would remove "
+                               "it".format(runner_ref(pool, i), at, name))
             else:
-                plan_line("-", "deregister and delete runner {} ({}, {})".format(
-                    runner_ref(pool, i), name, state))
+                plan_line("-", "deregister and delete runner {}{} ({}, {})".format(
+                    runner_ref(pool, i), at, name, state))
             acts += 1
         plan_done(acts)
         return
     removed = []
+    remote_batches = OrderedDict()  # (host, pool) -> [idx]
     for pool, i in sorted(refs, key=lambda r: (r[0].name, -r[1])):
+        if pool.host:
+            remote_batches.setdefault((pool.host, pool), []).append(i)
+            continue
         gh = sessions.for_pool(pool)
         if gh.manual:
             gh.warn_manual("cannot check busy state before removal")
         remote = sessions.remote(pool)
         if decommission(pool, i, gh, dc, remote, force):
             removed.append((pool, i))
-    if dc.running():
+    if dc and dc.running():
         dc.hup()
+    for (host, pool), idxs in remote_batches.items():
+        gh = sessions.for_pool(pool)
+        keep = []
+        if not force:
+            busy = sessions.busy(pool, "removal")
+            for i in idxs:
+                name = default_name(pool, i)
+                if name in busy:
+                    warn("{} is running a job; skipped (use --force)".format(name))
+                else:
+                    keep.append(i)
+        else:
+            keep = idxs
+        if not keep:
+            continue
+        try:
+            rc, out, errout = rhosts[host].invoke(
+                inst, ["--only", pool.name, "rm"] + [str(i) for i in keep] + ["--force"],
+                tokens=(None, gh.rem_token()))
+            relay(host, out, errout)
+            if rc != 0:
+                warn("rm on {} failed".format(host))
+            else:
+                removed += [(pool, i) for i in keep]
+        except Err as e:
+            warn(str(e))
     still_wanted = [runner_ref(p, i) for p, i in removed if i <= p.count]
     if still_wanted:
         warn("config still wants these; the next `runnerctl up` will "
@@ -1396,19 +1765,32 @@ def cmd_rm(inst, tokens, all_flag, force, dry=False):
 
 
 def cmd_svc(inst, action, tokens, force=False):
-    refs = resolve_refs(inst, tokens)
+    rhosts = remote_hosts_for(inst)
+    imap = pool_indices_map(inst, rhosts)
+    refs = resolve_refs(inst, tokens, imap)
     if not refs:
         raise Err("no registered runners; run `runnerctl up`")
-    bad = [runner_ref(p, i) for p, i in refs if not registered_name(p, i)]
+    bad = []
+    for pool, i in refs:
+        known = imap.get(pool.name)
+        if not pool.host and not registered_name(pool, i):
+            bad.append(runner_ref(pool, i))
+        elif pool.host and known is not None and i not in known:
+            bad.append("{}/{} (on {})".format(pool.name, i, pool.host))
     if bad:
         raise Err("no such runner(s): {}".format(", ".join(bad)))
-    dc = DaemonController(inst, announce=True)
     sessions = GitHubSessions()
+    dc = DaemonController(inst, announce=True) if inst.local_pools() else None
+    past = {"start": "started", "stop": "stopped", "restart": "restarted"}[action]
+    local_touched = False
+    remote_batches = OrderedDict()
     for pool, i in refs:
+        if pool.host:
+            remote_batches.setdefault(pool.host, []).append((pool, i))
+            continue
         name = registered_name(pool, i)
         if action in ("stop", "restart") and not force:
-            busy = sessions.busy(pool, action + "ping runners" if action == "stop"
-                                 else "restarting runners")
+            busy = sessions.busy(pool, "stopping runners")
             if name and name in busy:
                 warn("{} is running a job; skipped (use --force)".format(name))
                 continue
@@ -1418,29 +1800,85 @@ def cmd_svc(inst, action, tokens, force=False):
                 ok("stopped runner {}".format(runner_ref(pool, i)))
         if action in ("start", "restart"):
             enable_runner(pool, i)
-            ok("{} runner {}".format("restarted" if action == "restart" else "started",
+            ok("{} runner {}".format(past if action != "start" else "started",
                                      runner_ref(pool, i)))
-    if action in ("start", "restart"):
-        dc.reload_or_start()
-    elif dc.running():
-        dc.hup()
+        local_touched = True
+    if local_touched and dc:
+        if action in ("start", "restart"):
+            dc.reload_or_start()
+        elif dc.running():
+            dc.hup()
+    for host, items in remote_batches.items():
+        todo = []
+        for pool, i in items:
+            name = default_name(pool, i)
+            if action in ("stop", "restart") and not force:
+                if name in sessions.busy(pool, "stopping runners"):
+                    warn("{} is running a job; skipped (use --force)".format(name))
+                    continue
+            todo.append("{}/{}".format(pool.name, i))
+        if not todo:
+            continue
+        try:
+            rc, out, errout = rhosts[host].invoke(
+                inst, [action] + todo + ["--force"] if action != "start"
+                else [action] + todo)
+            relay(host, out, errout)
+            if rc != 0:
+                warn("{} on {} failed".format(action, host))
+        except Err as e:
+            warn(str(e))
+
+
+# ---------------------------------------------------------------- status / logs
+
+def cmd_agent_status(inst):
+    """Plumbing for the control machine: local daemon + runner state as JSON."""
+    dc = DaemonController(inst)
+    daemon_up = dc.running()
+    out = {"daemon": {"running": daemon_up, "pid": dc.pid(), "mode": dc.mode},
+           "pools": {}}
+    for pool in inst.local_pools():
+        entry = {}
+        for i in local_indices(pool):
+            entry[str(i)] = {"name": registered_name(pool, i),
+                             "state": runner_state(pool, i, daemon_up)}
+        out["pools"][pool.name] = entry
+    print(json.dumps(out))
 
 
 def cmd_status(inst):
-    dc = DaemonController(inst)
-    daemon_up = dc.running()
     sessions = GitHubSessions()
-    dstate = ("running (pid {}, {})".format(dc.pid(), dc.mode) if daemon_up
-              else "stopped")
+    rhosts = remote_hosts_for(inst)
+    dc = DaemonController(inst)
+    local_daemon_up = dc.running()
+    show_local = bool(inst.local_pools()) or local_daemon_up
     print()
     print("{} {}   config={}   pools: {}".format(
         paint("instance", BOLD), inst.name, inst.path,
-        ", ".join("{}={}".format(p.name, p.count) for p in inst.pools.values())))
-    print("{} {}".format(paint("supervisor", BOLD),
-                         paint(dstate, GREEN if daemon_up else RED)))
-    any_local = any(local_indices(p) for p in inst.pools.values())
-    if not daemon_up and any_local:
-        warn("supervisor not running — `runnerctl up` starts it")
+        ", ".join("{}{}={}".format(p.name, "@" + p.host if p.host else "", p.count)
+                  for p in inst.pools.values())))
+    if show_local:
+        dstate = ("running (pid {}, {})".format(dc.pid(), dc.mode)
+                  if local_daemon_up else "stopped")
+        print("{} {}".format(paint("supervisor", BOLD),
+                             paint(dstate, GREEN if local_daemon_up else RED)))
+        if not local_daemon_up and any(local_indices(p) for p in inst.local_pools()):
+            warn("local supervisor not running — `runnerctl up` starts it")
+    host_states = {}
+    for host in rhosts:
+        try:
+            host_states[host] = rhosts[host].state(inst, deploy=False)
+            d = host_states[host].get("daemon", {})
+            dstate = ("running (pid {}, {})".format(d.get("pid"), d.get("mode"))
+                      if d.get("running") else "stopped")
+            print("{} {}".format(paint("supervisor@" + host, BOLD),
+                                 paint(dstate, GREEN if d.get("running") else RED)))
+        except Err as e:
+            host_states[host] = None
+            print("{} {}".format(paint("supervisor@" + host, BOLD),
+                                 paint("unreachable", RED)))
+            warn(str(e))
     api_errs = {}
     remotes = {}
     for pool in inst.pools.values():
@@ -1456,28 +1894,48 @@ def cmd_status(inst):
             remotes[pool.name] = {}
     for msg in sorted(set(api_errs.values())):
         warn("GitHub side unavailable: " + msg)
-    header = [("POOL", None)] if not inst.single else []
-    rows = [header + [("IDX", None), ("NAME", None), ("RUNNER", None),
-                      ("GITHUB", None), ("JOB", None), ("", None)]]
+    rows = [([("POOL", None)] if not inst.single else [])
+            + [("IDX", None), ("NAME", None), ("RUNNER", None),
+               ("GITHUB", None), ("JOB", None), ("", None)]]
     matched = set()
     for pool in inst.pools.values():
-        have = local_indices(pool)
         remote = remotes[pool.name]
         perr = api_errs.get(pool.name)
+        pool_label = pool.name + ("@" + pool.host if pool.host else "")
+        if pool.host:
+            st = host_states.get(pool.host)
+            pl = (st or {}).get("pools", {}).get(pool.name, {})
+            have = sorted(int(k) for k in pl)
+            host_daemon = bool((st or {}).get("daemon", {}).get("running"))
+        else:
+            have = local_indices(pool)
         indices = sorted(set(have) | set(range(1, pool.count + 1)))
         for i in indices:
+            pcell = [(pool_label, None)] if not inst.single else []
             provisioned = i in have
-            name = registered_name(pool, i) if provisioned else None
+            if pool.host:
+                ent = pl.get(str(i)) or {}
+                name = ent.get("name") if provisioned else None
+                svc = (ent.get("state") or "-") if provisioned else "-"
+                if st is None:
+                    provisioned, name, svc = True, None, "?"
+            else:
+                name = registered_name(pool, i) if provisioned else None
+                svc = (runner_state(pool, i, local_daemon_up) if provisioned else "-")
             note = ""
-            pcell = [(pool.name, None)] if not inst.single else []
             if not provisioned:
                 rows.append(pcell + [(str(i), None), (default_name(pool, i), DIM),
                                      ("-", DIM), ("-", DIM), ("-", DIM),
                                      ("not provisioned (runnerctl up)", DIM)])
                 continue
             display = name or default_name(pool, i)
-            svc = runner_state(pool, i, daemon_up)
-            if name:
+            if pool.host and st is None:
+                gh_state, job, note = "?", "?", "host unreachable"
+                entry = remote.get(display)
+                if entry:
+                    gh_state = entry.get("status", "?")
+                    job = "busy" if entry.get("busy") else "idle"
+            elif name:
                 matched.add((pool.name, name))
                 entry = remote.get(name)
                 if entry:
@@ -1495,7 +1953,8 @@ def cmd_status(inst):
             rows.append(pcell + [
                 (str(i), None),
                 (display, None),
-                (svc, {"running": GREEN, "pending": YELLOW, "down": RED}.get(svc, DIM)),
+                (svc, {"running": GREEN, "pending": YELLOW, "down": RED,
+                       "?": YELLOW}.get(svc, DIM)),
                 (gh_state, {"online": GREEN, "offline": RED, "unregistered": YELLOW,
                             "unconfigured": YELLOW}.get(gh_state, DIM)),
                 (job, {"busy": YELLOW, "idle": GREEN}.get(job, DIM)),
@@ -1505,15 +1964,18 @@ def cmd_status(inst):
     for pool in inst.pools.values():
         prefix = (pool.name_prefix + "-" if pool.name == "default"
                   else "{}-{}-".format(pool.name_prefix, pool.name))
+        pool_label = pool.name + ("@" + pool.host if pool.host else "")
         for n in sorted(remotes[pool.name]):
             if (not n or not n.startswith(prefix) or (pool.name, n) in matched
                     or n in stale_seen):
                 continue
             if any((q.name, n) in matched for q in inst.pools.values()):
                 continue
+            if pool.host and host_states.get(pool.host) is None:
+                continue  # can't distinguish stale from unreachable
             stale_seen.add(n)
             e = remotes[pool.name][n]
-            pcell = [(pool.name, DIM)] if not inst.single else []
+            pcell = [(pool_label, DIM)] if not inst.single else []
             rows.append(pcell + [
                 ("-", DIM),
                 (n, None),
@@ -1552,13 +2014,23 @@ def cmd_logs(inst, token, follow, daemon):
             raise Err("no supervisor log yet: {}".format(logf))
         cmd = ["tail", "-n", "100"] + (["-f"] if follow else []) + [logf]
         os.execvp(cmd[0], cmd)
-    refs = resolve_refs(inst, [token] if token else [])
+    rhosts = remote_hosts_for(inst)
+    imap = pool_indices_map(inst, rhosts)
+    refs = resolve_refs(inst, [token] if token else [], imap)
     if not refs:
         raise Err("no runners provisioned; run `runnerctl up`")
     if len(refs) != 1:
         raise Err("pick one runner: runnerctl logs {}".format(
             "<idx>" if inst.single else "<pool>/<idx>"))
     pool, idx = refs[0]
+    if pool.host:
+        rh = rhosts[pool.host]
+        rh.deploy(inst)
+        script, conf = rh._paths(inst)
+        remote_cmd = '"{}" -c "{}" --as-host {} --agent logs {}{}'.format(
+            script, conf, shlex.quote(pool.host),
+            shlex.quote("{}/{}".format(pool.name, idx)), " -f" if follow else "")
+        os.execvp("ssh", ["ssh", "-t", pool.host, "--", remote_cmd])
     logf = runner_logfile(pool, idx)
     if not os.path.isfile(logf):
         raise Err("no log yet for runner {}: {}".format(runner_ref(pool, idx), logf))
@@ -1567,17 +2039,18 @@ def cmd_logs(inst, token, follow, daemon):
 
 
 def cmd_config(inst):
-    dc = DaemonController(inst)
     print("config file: {}".format(inst.path))
     print("instance: {}".format(inst.name))
-    print("manager: {}{}".format(
-        inst.manager,
-        "  (resolves to: {})".format(dc.mode) if inst.manager == "auto" else ""))
+    mgr_note = ""
+    if inst.manager == "auto" and inst.local_pools():
+        mgr_note = "  (resolves locally to: {})".format(
+            DaemonController(inst).mode)
+    print("manager: {}{}".format(inst.manager, mgr_note))
     for pool in inst.pools.values():
         print("[pool.{}]".format(pool.name) if not inst.single or pool.name != "default"
               else "[pool]")
         for key in ("url", "count", "labels", "base_dir", "version",
-                    "name_prefix", "group", "dir_prefix"):
+                    "name_prefix", "group", "dir_prefix", "host"):
             val = getattr(pool, key)
             shown = val if isinstance(val, str) else json.dumps(val)
             print("  {} = {}".format(key, shown))
@@ -1586,15 +2059,21 @@ def cmd_config(inst):
 # ---------------------------------------------------------------- entry point
 
 def main(argv=None):
+    global AGENT_MODE
     ap = argparse.ArgumentParser(
         prog="runnerctl",
         description="Sudoless, config-driven pool manager for self-hosted "
-                    "GitHub Actions runners. One supervisor service owns all "
-                    "runner processes of all pools in the config file.")
+                    "GitHub Actions runners — local and over ssh. One "
+                    "supervisor per machine owns that machine's runners; the "
+                    "GitHub token never leaves the control machine.")
     ap.add_argument("-c", "--config", metavar="FILE",
                     help="config file (default: ./runners.toml, "
                          "~/.config/runnerctl/runners.toml)")
     ap.add_argument("--version", action="version", version="runnerctl " + VERSION)
+    ap.add_argument("--as-host", metavar="H", help=argparse.SUPPRESS)
+    ap.add_argument("--only", metavar="POOL", help=argparse.SUPPRESS)
+    ap.add_argument("--tokens-stdin", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--agent", action="store_true", help=argparse.SUPPRESS)
     sub = ap.add_subparsers(dest="cmd", metavar="command")
     sub.required = True
 
@@ -1605,11 +2084,12 @@ def main(argv=None):
                    help="prune surplus runners even if busy")
     p.add_argument("-n", "--dry-run", action="store_true",
                    help="show the plan without changing anything")
-    sub.add_parser("reload", help="soft apply: make the supervisor re-read the "
-                                  "config (start it if stopped); no GitHub work")
+    p.add_argument("--no-prune", action="store_true", help=argparse.SUPPRESS)
+    sub.add_parser("reload", help="soft apply: supervisors re-read the config "
+                                  "(started if stopped); no GitHub work")
     sub.add_parser("status", aliases=["ps"],
-                   help="show pool status (supervisor + runners + GitHub)")
-    p = sub.add_parser("down", help="stop the supervisor and all runners; "
+                   help="show pool status (supervisors + runners + GitHub)")
+    p = sub.add_parser("down", help="stop all supervisors and runners; "
                                     "keep registrations")
     p.add_argument("--force", action="store_true", help="stop even busy runners")
     p.add_argument("-n", "--dry-run", action="store_true",
@@ -1636,10 +2116,12 @@ def main(argv=None):
     sub.add_parser("config", help="print the resolved configuration")
     sub.add_parser("daemon", help="run the supervisor in the foreground "
                                   "(normally started for you by `up`)")
+    sub.add_parser("agent-status", help=argparse.SUPPRESS)
     sub.add_parser("check-update", help="check whether a newer runnerctl exists")
     sub.add_parser("update", help="update runnerctl in place (never automatic)")
 
     args = ap.parse_args(argv)
+    AGENT_MODE = bool(args.agent)
     try:
         if args.cmd == "init":
             cmd_init(args.config or "runners.toml")
@@ -1651,8 +2133,21 @@ def main(argv=None):
             cmd_update()
             return 0
         inst = load_config(find_config(args.config))
+        if args.as_host:
+            scope_instance(inst, args.as_host)
+        if args.only:
+            if args.only not in inst.pools:
+                raise Err("--only: no such pool {!r}".format(args.only))
+            inst.pools = OrderedDict([(args.only, inst.pools[args.only])])
+        if args.tokens_stdin:
+            reg = sys.stdin.readline().strip()
+            rem = sys.stdin.readline().strip()
+            if reg:
+                os.environ["RUNNERCTL_REG_TOKEN"] = reg
+            if rem:
+                os.environ["RUNNERCTL_REM_TOKEN"] = rem
         if args.cmd == "up":
-            cmd_up(inst, args.force, args.dry_run)
+            cmd_up(inst, args.force, args.dry_run, args.no_prune)
         elif args.cmd == "reload":
             cmd_reload(inst)
         elif args.cmd in ("status", "ps"):
@@ -1667,6 +2162,8 @@ def main(argv=None):
             cmd_logs(inst, args.ref, args.follow, args.daemon)
         elif args.cmd == "config":
             cmd_config(inst)
+        elif args.cmd == "agent-status":
+            cmd_agent_status(inst)
         elif args.cmd == "daemon":
             Supervisor(inst).run()
     except Err as e:
