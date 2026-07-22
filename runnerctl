@@ -38,13 +38,18 @@ import urllib.request
 
 from collections import OrderedDict
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 RAW_SELF_URL = "https://raw.githubusercontent.com/flinner/gh-runnerctl/main/runnerctl"
 
 API_ROOT = "https://api.github.com"
 REMOTE_BASE = "$HOME/.local/share/runnerctl"
 
 AGENT_MODE = False  # set by --agent: invoked over ssh by a control machine
+
+# config schema version, independent of the tool version: bump MINOR when
+# adding keys (older tools warn), MAJOR when semantics change incompatibly
+# (older/newer tools refuse the file)
+CONFIG_SCHEMA = (1, 0)
 
 INSTANCE_DEFAULTS = {
     "name": "default",
@@ -66,6 +71,8 @@ POOL_DEFAULTS = {
 
 CONFIG_TEMPLATE = '''# runnerctl configuration — `runnerctl up` converges every pool to this file.
 # One file = one instance; it may define any number of pools, local or remote.
+
+config_version = "1.0"
 
 [pool]
 url = "https://github.com/YOUR-ORG"   # org URL (runners serve all repos) or a single repo URL
@@ -304,6 +311,33 @@ def load_config(path):
     except Exception as e:
         raise Err("cannot parse {}: {}".format(path, e))
 
+    raw_schema = doc.get("config_version")
+    if raw_schema is not None and not isinstance(raw_schema, dict):
+        if isinstance(raw_schema, bool) or isinstance(raw_schema, float):
+            raise Err('{}: config_version must be a string like "1.0"'.format(path))
+        if isinstance(raw_schema, int):
+            file_schema = (raw_schema, 0)
+        else:
+            m = re.match(r"(\d+)(?:\.(\d+))?$", str(raw_schema).strip())
+            if not m:
+                raise Err('{}: config_version must look like "1.0"'.format(path))
+            file_schema = (int(m.group(1)), int(m.group(2) or 0))
+        if file_schema[0] != CONFIG_SCHEMA[0]:
+            hint = ("run `runnerctl update`" if file_schema[0] > CONFIG_SCHEMA[0]
+                    else "migrate the config or use an older runnerctl")
+            raise Err("{}: config_version {}.{} is incompatible with this "
+                      "runnerctl (schema {}.{}) — {}".format(
+                          path, file_schema[0], file_schema[1],
+                          CONFIG_SCHEMA[0], CONFIG_SCHEMA[1], hint))
+        if file_schema[1] > CONFIG_SCHEMA[1]:
+            warn("{}: config schema {}.{} is newer than this runnerctl "
+                 "(schema {}.{}); some keys may be ignored — consider "
+                 "`runnerctl update`".format(path, file_schema[0], file_schema[1],
+                                             CONFIG_SCHEMA[0], CONFIG_SCHEMA[1]))
+        elif file_schema[1] < CONFIG_SCHEMA[1]:
+            warn("{}: config written for older schema {}.{} (current {}.{}); "
+                 "still compatible".format(path, file_schema[0], file_schema[1],
+                                           CONFIG_SCHEMA[0], CONFIG_SCHEMA[1]))
     defaults_tbl = doc.get("defaults", {})
     if not isinstance(defaults_tbl, dict):
         raise Err("{}: [defaults] must be a table".format(path))
@@ -342,7 +376,7 @@ def load_config(path):
     # its own supervisor; a bare top-level `manager` acts as a global default
     top_manager = doc.get("manager") if not isinstance(doc.get("manager"), dict) else None
 
-    known_top = {"pool", "defaults", "manager"} | set(INSTANCE_DEFAULTS)
+    known_top = {"pool", "defaults", "manager", "config_version"} | set(INSTANCE_DEFAULTS)
     unknown_top = sorted(k for k in doc if k not in known_top)
     if unknown_top:
         warn("{}: ignoring unknown key(s): {}".format(path, ", ".join(unknown_top)))

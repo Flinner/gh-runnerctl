@@ -7,6 +7,7 @@
 # machine: remote hosts only ever receive short-lived registration/removal
 # tokens, piped over ssh stdin.
 
+config_version = "1.0"                  # schema: major mismatch = refused, minor = warning
 name = "default"                        # instance name -> runnerctl-<name>-<machine>.service
 check_updates = "ask"                   # after `status`: ask | always | never (never installs)
 

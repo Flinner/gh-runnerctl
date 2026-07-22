@@ -8,7 +8,7 @@ on one machine or a whole fleet over ssh.**
 One Python file. Standard library only. Nothing to install on remote hosts.
 
 [![Python](https://img.shields.io/badge/python-3.6%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-0.3.0-blue)](https://github.com/flinner/gh-runnerctl/blob/main/runnerctl)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue)](https://github.com/flinner/gh-runnerctl/blob/main/runnerctl)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)](#install)
 [![Platform](https://img.shields.io/badge/platform-linux-lightgrey)](#limitations)
@@ -132,6 +132,7 @@ names are plain `<host>-<N>`.
 | Key | Default | Meaning |
 |---|---|---|
 | `name` (top level) | `default` | Instance identity; names supervisor services and state |
+| `config_version` (top level) | — | Schema version (`"1.0"`): major mismatch is refused, minor mismatch warns |
 | `check_updates` (top level) | `ask` | After `status`: `ask` \| `always` \| `never` — checks only, never installs |
 | `url` | — | Org URL (`https://github.com/my-org`) or repo URL (`.../owner/repo`) |
 | `count` | `2` | Desired runners in the pool; `up` converges both directions |
