@@ -5,7 +5,7 @@
 **One Python file. Standard library only. Nothing to install on remote hosts.**
 
 [![Python](https://img.shields.io/badge/python-3.6%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-0.4.0-blue)](https://github.com/flinner/gh-runnerctl/blob/main/runnerctl)
+[![Version](https://img.shields.io/badge/version-0.4.1-blue)](https://github.com/flinner/gh-runnerctl/blob/main/runnerctl)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)](#install)
 [![Platform](https://img.shields.io/badge/platform-linux-lightgrey)](#limitations)
@@ -157,6 +157,7 @@ of it), or a bare index in single-pool files.
 | `up [--force] [-n]` | Converge every pool to the config (provision, register, supervise, prune) |
 | `reload` | Supervisors re-read the config and apply it; no GitHub work |
 | `status` / `ps` | Pool table: supervisors + runner processes + GitHub online/busy |
+| `watch [-i SEC]` | Live-refreshing status (default every 10 s) |
 | `down [--force] [-n]` | Stop all supervisors and runners, keep registrations |
 | `rm <ref...> \| --all [--force] [-n]` | Deregister and delete runners |
 | `start` / `stop` / `restart <ref...>` | Per-runner control (stopped runners stay registered, not respawned) |

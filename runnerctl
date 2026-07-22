@@ -38,7 +38,7 @@ import urllib.request
 
 from collections import OrderedDict
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 RAW_SELF_URL = "https://raw.githubusercontent.com/flinner/gh-runnerctl/main/runnerctl"
 
 API_ROOT = "https://api.github.com"
@@ -120,14 +120,6 @@ def ok(msg):
 
 def warn(msg):
     print(paint("!!", YELLOW) + " " + msg, file=sys.stderr)
-
-
-def relay(host, out, errout):
-    """Show a remote command's output, tagged with its host."""
-    for line in out.strip().splitlines():
-        print("  " + paint("[{}]".format(host), DIM) + " " + line)
-    for line in errout.strip().splitlines():
-        print("  " + paint("[{}]".format(host), DIM) + " " + line, file=sys.stderr)
 
 
 def run(cmd, cwd=None, check=False):
@@ -675,12 +667,33 @@ class RemoteHost:
         return (REMOTE_BASE + "/runnerctl",
                 REMOTE_BASE + "/{}.toml".format(inst.name))
 
-    def _ssh(self, remote_cmd, stdin_bytes=None, timeout=600):
+    def _ssh(self, remote_cmd, stdin_bytes=None, timeout=600, stream=False):
+        cmd = ["ssh", "-o", "BatchMode=yes", self.host, "--", remote_cmd]
         try:
-            return subprocess.run(
-                ["ssh", "-o", "BatchMode=yes", self.host, "--", remote_cmd],
-                input=stdin_bytes, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                timeout=timeout)
+            if not stream:
+                return subprocess.run(cmd, input=stdin_bytes,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                      timeout=timeout)
+            # live mode: print each remote line as it arrives so the user sees
+            # downloads/registrations happening instead of a silent wait
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            try:
+                if stdin_bytes:
+                    proc.stdin.write(stdin_bytes)
+                proc.stdin.close()
+            except BrokenPipeError:
+                pass
+            tag = paint("[{}]".format(self.host), DIM)
+            lines = []
+            for raw in iter(proc.stdout.readline, b""):
+                line = raw.decode("utf-8", "replace").rstrip("\n")
+                lines.append(line)
+                print("  {} {}".format(tag, line), flush=True)
+            proc.stdout.close()
+            proc.wait()
+            out = ("\n".join(lines) + "\n").encode() if lines else b""
+            return subprocess.CompletedProcess(cmd, proc.returncode, out, b"")
         except subprocess.TimeoutExpired:
             raise Err("ssh to {} timed out".format(self.host))
         except FileNotFoundError:
@@ -689,6 +702,7 @@ class RemoteHost:
     def deploy(self, inst):
         if self._deployed:
             return
+        info("deploying runnerctl to {} ...".format(self.host))
         script_path = os.path.realpath(os.path.abspath(sys.argv[0]))
         with open(script_path, "rb") as f:
             script = f.read()
@@ -710,9 +724,11 @@ class RemoteHost:
                 self.host, (p.stderr or b"").decode("utf-8", "replace").strip()))
         self._deployed = True
 
-    def invoke(self, inst, args, tokens=None, deploy=True):
+    def invoke(self, inst, args, tokens=None, deploy=True, stream=False):
         """Run remote runnerctl. `args` may start with extra global flags
-        (e.g. --only). tokens = (reg, rem) piped via stdin, never argv."""
+        (e.g. --only). tokens = (reg, rem) piped via stdin, never argv.
+        stream=True prints remote output live (already host-tagged), so
+        callers must not relay it again."""
         if deploy:
             self.deploy(inst)
         script, conf = self._paths(inst)
@@ -723,7 +739,7 @@ class RemoteHost:
             argv.append("--tokens-stdin")
             stdin = "{}\n{}\n".format(tokens[0] or "", tokens[1] or "").encode()
         argv += [shlex.quote(str(a)) for a in args]
-        p = self._ssh(" ".join(argv), stdin_bytes=stdin)
+        p = self._ssh(" ".join(argv), stdin_bytes=stdin, stream=stream)
         out = (p.stdout or b"").decode("utf-8", "replace")
         errout = (p.stderr or b"").decode("utf-8", "replace")
         if p.returncode == 255:
@@ -975,8 +991,18 @@ def ensure_tarball(pool, version):
     info("downloading {}".format(name))
     os.makedirs(pool.base_dir, exist_ok=True)
     tmp = path + ".part"
+    milestones = {"done": 0}
+
+    def hook(nblocks, blocksize, total):
+        if total <= 0:
+            return
+        quarter = min(4, nblocks * blocksize * 4 // total)
+        if quarter > milestones["done"]:
+            milestones["done"] = quarter
+            info("downloaded {}% of {} MB".format(quarter * 25, total // 1000000))
+
     try:
-        urllib.request.urlretrieve(url, tmp)
+        urllib.request.urlretrieve(url, tmp, reporthook=hook)
     except (urllib.error.URLError, OSError) as e:
         raise Err("download failed: {}".format(e))
     os.replace(tmp, path)
@@ -1567,20 +1593,18 @@ def _up_remote(inst, sessions, rhosts, force):
                 else:
                     prune.append(i)
             tokens = (gh.reg_token(), None) if missing else None
-            rc, out, errout = rh.invoke(
+            rc, _out, _err = rh.invoke(
                 inst, ["--only", pool.name, "up", "--no-prune"]
                       + (["--force"] if force else []),
-                tokens=tokens)
-            relay(host, out, errout)
+                tokens=tokens, stream=True)
             if rc != 0:
                 warn("up for pool {!r} on {} failed".format(pool.name, host))
                 continue
             if prune:
-                rc, out, errout = rh.invoke(
+                rc, _out, _err = rh.invoke(
                     inst, ["--only", pool.name, "rm"]
                           + [str(i) for i in prune] + ["--force"],
-                    tokens=(None, gh.rem_token()))
-                relay(host, out, errout)
+                    tokens=(None, gh.rem_token()), stream=True)
                 if rc != 0:
                     warn("pruning pool {!r} on {} failed".format(pool.name, host))
 
@@ -1690,8 +1714,7 @@ def cmd_reload(inst):
     for host, _pools in inst.remote_hosts().items():
         rh = RemoteHost(host)
         try:
-            rc, out, errout = rh.invoke(inst, ["reload"])
-            relay(host, out, errout)
+            rc, _out, _err = rh.invoke(inst, ["reload"], stream=True)
             if rc != 0:
                 warn("reload on {} failed".format(host))
         except Err as e:
@@ -1742,8 +1765,7 @@ def cmd_down(inst, force=False, dry=False):
         ok("local supervisor stopped")
     for host, _pools in rhosts.items():
         try:
-            rc, out, errout = rhosts[host].invoke(inst, ["down", "--force"])
-            relay(host, out, errout)
+            rc, _out, _err = rhosts[host].invoke(inst, ["down", "--force"], stream=True)
             if rc != 0:
                 warn("down on {} failed".format(host))
         except Err as e:
@@ -1826,10 +1848,9 @@ def cmd_rm(inst, tokens, all_flag, force, dry=False):
         if not keep:
             continue
         try:
-            rc, out, errout = rhosts[host].invoke(
+            rc, _out, _err = rhosts[host].invoke(
                 inst, ["--only", pool.name, "rm"] + [str(i) for i in keep] + ["--force"],
-                tokens=(None, gh.rem_token()))
-            relay(host, out, errout)
+                tokens=(None, gh.rem_token()), stream=True)
             if rc != 0:
                 warn("rm on {} failed".format(host))
             else:
@@ -1898,10 +1919,9 @@ def cmd_svc(inst, action, tokens, force=False):
         if not todo:
             continue
         try:
-            rc, out, errout = rhosts[host].invoke(
-                inst, [action] + todo + ["--force"] if action != "start"
-                else [action] + todo)
-            relay(host, out, errout)
+            rc, _out, _err = rhosts[host].invoke(
+                inst, ([action] + todo + ["--force"]) if action != "start"
+                else [action] + todo, stream=True)
             if rc != 0:
                 warn("{} on {} failed".format(action, host))
         except Err as e:
@@ -2078,6 +2098,21 @@ def cmd_status(inst):
     print()
 
 
+def cmd_watch(inst, interval):
+    if not _tty():
+        raise Err("watch needs a terminal (pipe `status` instead)")
+    interval = max(2.0, interval)
+    while True:
+        print("\033[2J\033[H", end="")
+        print(paint("runnerctl watch", BOLD) + "   {}   every {:.0f}s — Ctrl-C to quit".format(
+            time.strftime("%H:%M:%S"), interval))
+        try:
+            cmd_status(inst)
+        except Err as e:
+            warn(str(e))
+        time.sleep(interval)
+
+
 def maybe_offer_update(inst):
     """After `status`: check for updates per the check_updates config key
     ("ask" prompts on a TTY, "always" checks silently, "never" skips)."""
@@ -2187,6 +2222,9 @@ def main(argv=None):
                                   "(started if stopped); no GitHub work")
     sub.add_parser("status", aliases=["ps"],
                    help="show pool status (supervisors + runners + GitHub)")
+    p = sub.add_parser("watch", help="live-refreshing status")
+    p.add_argument("-i", "--interval", type=float, default=10, metavar="SEC",
+                   help="refresh interval (default 10s, min 2s)")
     p = sub.add_parser("down", help="stop all supervisors and runners; "
                                     "keep registrations")
     p.add_argument("--force", action="store_true", help="stop even busy runners")
@@ -2251,6 +2289,8 @@ def main(argv=None):
         elif args.cmd in ("status", "ps"):
             cmd_status(inst)
             maybe_offer_update(inst)
+        elif args.cmd == "watch":
+            cmd_watch(inst, args.interval)
         elif args.cmd == "down":
             cmd_down(inst, args.force, args.dry_run)
         elif args.cmd == "rm":
