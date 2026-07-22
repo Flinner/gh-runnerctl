@@ -5,7 +5,7 @@
 **One Python file. Standard library only. Nothing to install on remote hosts.**
 
 [![Python](https://img.shields.io/badge/python-3.6%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-0.4.1-blue)](https://github.com/flinner/gh-runnerctl/blob/main/runnerctl)
+[![Version](https://img.shields.io/badge/version-0.4.2-blue)](https://github.com/flinner/gh-runnerctl/blob/main/runnerctl)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)](#install)
 [![Platform](https://img.shields.io/badge/platform-linux-lightgrey)](#limitations)

@@ -19,6 +19,7 @@
 # over stdin — the GitHub token itself never leaves the control machine.
 
 import argparse
+import contextlib
 import getpass
 import io
 import json
@@ -38,7 +39,7 @@ import urllib.request
 
 from collections import OrderedDict
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 RAW_SELF_URL = "https://raw.githubusercontent.com/flinner/gh-runnerctl/main/runnerctl"
 
 API_ROOT = "https://api.github.com"
@@ -100,8 +101,16 @@ class Err(Exception):
 GREEN, RED, YELLOW, DIM, CYAN, BOLD = "32", "31", "33", "2", "36", "1"
 
 
+_TTY = None
+
+
 def _tty():
-    return sys.stdout.isatty()
+    # cached from the REAL stdout on first use, so buffered rendering
+    # (watch double-buffers a frame through StringIO) keeps its colors
+    global _TTY
+    if _TTY is None:
+        _TTY = sys.stdout.isatty()
+    return _TTY
 
 
 def paint(s, code):
@@ -2103,14 +2112,23 @@ def cmd_watch(inst, interval):
         raise Err("watch needs a terminal (pipe `status` instead)")
     interval = max(2.0, interval)
     while True:
-        print("\033[2J\033[H", end="")
-        print(paint("runnerctl watch", BOLD) + "   {}   every {:.0f}s — Ctrl-C to quit".format(
-            time.strftime("%H:%M:%S"), interval))
+        # poll in flight: render the whole frame into a buffer first, then
+        # clear and paint atomically — the screen is never blank mid-fetch
+        started = time.time()
+        frame = io.StringIO()
         try:
-            cmd_status(inst)
+            with contextlib.redirect_stdout(frame), contextlib.redirect_stderr(frame):
+                cmd_status(inst)
         except Err as e:
-            warn(str(e))
-        time.sleep(interval)
+            frame.write(paint("error:", RED) + " " + str(e) + "\n")
+        stamp = time.strftime("%H:%M:%S")
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.write(paint("runnerctl watch", BOLD)
+                         + "   as of {}   every {:.0f}s — Ctrl-C to quit\n".format(
+                             stamp, interval))
+        sys.stdout.write(frame.getvalue())
+        sys.stdout.flush()
+        time.sleep(max(0.5, interval - (time.time() - started)))
 
 
 def maybe_offer_update(inst):
