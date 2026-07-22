@@ -16,7 +16,7 @@ base_dir = "~/gh-runners"               # runners live in <base_dir>/<dir_prefix
 version = "latest"                      # runner release, e.g. "2.335.1", or "latest"
 
 [pool.head]
-host = "acclhead1"                      # ssh alias; "" or omitted = this machine
+host = "user@acclhead1.example.org"     # ssh destination (alias or user@host); "" = this machine
 count = 4
 labels = ["self-hosted", "linux", "x64"]
 

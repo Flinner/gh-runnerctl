@@ -38,7 +38,7 @@ import urllib.request
 
 from collections import OrderedDict
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 RAW_SELF_URL = "https://raw.githubusercontent.com/flinner/gh-runnerctl/main/runnerctl"
 
 API_ROOT = "https://api.github.com"
@@ -368,11 +368,14 @@ def load_config(path):
         if not data["labels"] or not all(isinstance(x, str) for x in data["labels"]):
             raise Err("{}: {}: labels must be a non-empty list of strings".format(path, where))
         data["host"] = str(data["host"]).strip()
+        if data["host"] and not re.match(r"(?:[\w.-]+@)?[\w.-]+$", data["host"]):
+            raise Err("{}: {}: host must be an ssh destination like "
+                      "user@node.example.org (or an ssh alias)".format(path, where))
         data["version"] = str(data["version"])
         if not data["name_prefix"]:
-            # remote pools default to the host alias so both the control
+            # remote pools default to the host's slug so both the control
             # machine and the remote agent derive identical runner names
-            data["name_prefix"] = data["host"] or hostname
+            data["name_prefix"] = host_slug(data["host"]) if data["host"] else hostname
         if not data["dir_prefix"]:
             data["dir_prefix"] = "runner" if pname == "default" else pname
         if not data["host"]:
@@ -715,12 +718,27 @@ def runner_dir(pool, i):
     return os.path.join(pool.base_dir, "{}{}".format(pool.dir_prefix, i))
 
 
+def host_slug(host):
+    """A filesystem/systemd-safe machine name from an ssh destination:
+    'user@node1.example.org' -> 'node1'. The '@' must never reach a systemd
+    unit name (it is the template separator) and runner names dislike it."""
+    bare = host.split("@", 1)[-1]
+    first = bare.split(".")[0]
+    if first.isdigit():  # IP address: the first octet is no identity
+        return re.sub(r"[^A-Za-z0-9_-]", "-", bare).strip("-")
+    short = re.sub(r"[^A-Za-z0-9_-]", "-", first).strip("-")
+    return short or re.sub(r"[^A-Za-z0-9_-]", "-", bare).strip("-")
+
+
 def machine_id(inst):
-    """This machine's identity for state/unit scoping: the --as-host alias on
-    a remote agent, the local hostname on the control machine. Keeps clusters
-    with SHARED home directories safe — every machine gets its own state and
-    unit even though they see the same files."""
-    return inst.as_host or socket.gethostname().split(".")[0]
+    """This machine's identity for state/unit scoping: the slug of the
+    --as-host destination on a remote agent, the local hostname on the
+    control machine. Keeps clusters with SHARED home directories safe —
+    every machine gets its own state and unit even though they see the
+    same files."""
+    if inst.as_host:
+        return host_slug(inst.as_host)
+    return socket.gethostname().split(".")[0]
 
 
 def state_dir(inst):
@@ -1901,7 +1919,7 @@ def cmd_status(inst):
     for pool in inst.pools.values():
         remote = remotes[pool.name]
         perr = api_errs.get(pool.name)
-        pool_label = pool.name + ("@" + pool.host if pool.host else "")
+        pool_label = pool.name + ("@" + host_slug(pool.host) if pool.host else "")
         if pool.host:
             st = host_states.get(pool.host)
             pl = (st or {}).get("pools", {}).get(pool.name, {})
@@ -1964,7 +1982,7 @@ def cmd_status(inst):
     for pool in inst.pools.values():
         prefix = (pool.name_prefix + "-" if pool.name == "default"
                   else "{}-{}-".format(pool.name_prefix, pool.name))
-        pool_label = pool.name + ("@" + pool.host if pool.host else "")
+        pool_label = pool.name + ("@" + host_slug(pool.host) if pool.host else "")
         for n in sorted(remotes[pool.name]):
             if (not n or not n.startswith(prefix) or (pool.name, n) in matched
                     or n in stale_seen):
