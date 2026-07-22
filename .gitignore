@@ -1,3 +1,4 @@
 runners.toml
 __pycache__/
 *.pyc
+docs/prior-art.md

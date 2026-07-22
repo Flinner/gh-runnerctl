@@ -2,12 +2,39 @@
 # Copy to runners.toml (or ~/.config/runnerctl/runners.toml) and edit.
 
 [pool]
+name = "default"                       # pool identity: names the supervisor service and its state
 url = "https://github.com/YOUR-ORG"   # org URL (runners serve all repos) or a single repo URL
 count = 4                              # desired number of runners on this host
 labels = ["self-hosted", "linux", "x64"]
 base_dir = "~/actions-runner"          # runners live in <base_dir>/<dir_prefix><N>
 version = "latest"                     # runner release, e.g. "2.335.1", or "latest"
 name_prefix = ""                       # GitHub-side names <prefix>-<N>; default: this hostname
-manager = "auto"                       # auto | systemd | nohup (both sudoless)
+manager = "auto"                       # how the supervisor is hosted: auto | systemd | nohup
 group = ""                             # optional runner group (org-level only)
 dir_prefix = "runner"                  # set "actions" to adopt an existing actions<N> layout
+
+# ---------------------------------------------------------------------------
+# Multiple pools on one host
+#
+# One config file = one pool = one supervisor service. To run several pools
+# (different orgs, labels, or repo scopes), write one file per pool with a
+# distinct `name`, and address each with -c:
+#
+#     runnerctl -c runners.toml up          # pool "default"
+#     runnerctl -c gpu.toml up              # pool "gpu"
+#     runnerctl -c gpu.toml status
+#
+# gpu.toml:
+#
+#     [pool]
+#     name = "gpu"                          # -> service runnerctl-gpu.service
+#     url = "https://github.com/YOUR-ORG"
+#     count = 2
+#     labels = ["self-hosted", "linux", "x64", "gpu", "cuda"]
+#     base_dir = "~/actions-runner"         # sharing base_dir is fine...
+#     dir_prefix = "gpu"                    # ...with a distinct dir_prefix
+#
+# Each pool gets its own supervisor (runnerctl-<name>.service), its own state
+# under <base_dir>/.runnerctl/<name>/, and — for named pools — GitHub-side
+# runner names <host>-<name>-<N>, so pools never collide. Pools may also use
+# entirely separate base_dirs; then dir_prefix can stay "runner".

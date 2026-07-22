@@ -2,6 +2,14 @@
 # runnerctl — sudoless, config-driven pool manager for self-hosted GitHub Actions runners.
 # Single file, Python 3.6+ standard library only.
 # https://github.com/flinner/gh-runnerctl
+#
+# Architecture: ONE supervisor process (`runnerctl daemon`) owns all runner
+# processes as direct children, restarting each independently with backoff.
+# The supervisor is hosted either as a single user-level systemd service
+# (runnerctl.service) or as a detached process on hosts without a systemd
+# user bus. All GitHub work (registration, busy checks, interactive token
+# prompts) lives in the CLI commands; the daemon needs no tokens and is
+# controlled with SIGHUP (rescan) plus per-runner marker files.
 
 import argparse
 import getpass
@@ -20,10 +28,18 @@ import urllib.error
 import urllib.request
 
 API_ROOT = "https://api.github.com"
-UNIT_NAME = "gh-runner@{}.service"
-UNIT_PATH = os.path.expanduser("~/.config/systemd/user/gh-runner@.service")
+
+
+def unit_name(cfg):
+    return "runnerctl-{}.service".format(cfg.name)
+
+
+def unit_path(cfg):
+    return os.path.expanduser("~/.config/systemd/user/" + unit_name(cfg))
+
 
 DEFAULTS = {
+    "name": "default",
     "url": "",
     "count": 2,
     "labels": ["self-hosted"],
@@ -36,6 +52,8 @@ DEFAULTS = {
 }
 
 CONFIG_TEMPLATE = '''# runnerctl pool configuration — `runnerctl up` converges the pool to this file.
+# One file = one pool = one supervisor. For several pools on one host, use one
+# file per pool with distinct `name` (see runners.toml.example in the repo).
 
 [pool]
 url = "https://github.com/YOUR-ORG"   # org URL (runners serve all repos) or a single repo URL
@@ -44,7 +62,7 @@ labels = ["self-hosted", "linux", "x64"]
 base_dir = "~/actions-runner"          # runners live in <base_dir>/<dir_prefix><N>
 version = "latest"                     # runner release, e.g. "2.335.1", or "latest"
 name_prefix = ""                       # GitHub-side names <prefix>-<N>; default: this hostname
-manager = "auto"                       # auto | systemd | nohup (both sudoless)
+manager = "auto"                       # how the supervisor is hosted: auto | systemd | nohup
 group = ""                             # optional runner group (org-level only)
 dir_prefix = "runner"                  # set "actions" to adopt an existing actions<N> layout
 '''
@@ -148,7 +166,7 @@ def _parse_val(s):
 
 def _parse_toml_min(text):
     """Minimal TOML subset: [tables], strings, ints, bools, one-line string arrays."""
-    root, cur = {}, None
+    root = {}
     cur = root
     for lineno, raw in enumerate(text.splitlines(), 1):
         line = _strip_comment(raw.strip())
@@ -228,6 +246,9 @@ def load_config(path):
         warn("{}: ignoring unknown key(s): {}".format(path, ", ".join(unknown)))
     data = dict(DEFAULTS)
     data.update({k: v for k, v in pool.items() if k in DEFAULTS})
+    data["name"] = str(data["name"])
+    if not re.match(r"[A-Za-z0-9_-]+$", data["name"]):
+        raise Err("{}: name must be alphanumeric/dash/underscore".format(path))
     if not data["url"] or "YOUR-ORG" in data["url"]:
         raise Err("set `url` in {} to your org or repo".format(path))
     api_scope(data["url"])  # validate shape early
@@ -244,6 +265,21 @@ def load_config(path):
     if not data["name_prefix"]:
         data["name_prefix"] = socket.gethostname().split(".")[0]
     return Config(data, path)
+
+
+def rewrite_count(cfg, n):
+    """Persist a new count into the config file (scale is config-driven)."""
+    with open(cfg.path) as f:
+        text = f.read()
+    new, hits = re.subn(r"(?m)^(\s*count\s*=\s*)\d+", r"\g<1>{}".format(n), text, count=1)
+    if hits == 0:
+        new, hits = re.subn(r"(?m)^\[pool\][ \t]*$", "[pool]\ncount = {}".format(n),
+                            text, count=1)
+    if hits == 0:
+        raise Err("cannot find a place for `count` in {}".format(cfg.path))
+    with open(cfg.path, "w") as f:
+        f.write(new)
+    info("set count = {} in {}".format(n, cfg.path))
 
 
 # ---------------------------------------------------------------- GitHub
@@ -300,6 +336,8 @@ class GitHub:
         self.token = get_token()
         self._reg = None
         self._rem = None
+        self._reg_cache = (None, 0.0)
+        self._rem_cache = (None, 0.0)
         self._warned = False
 
     @property
@@ -334,21 +372,31 @@ class GitHub:
             raise Err("aborted: no {} token provided".format(kind))
         return val
 
+    def _minted(self, cache, kind, refresh):
+        """API-minted tokens last ~1h: mint once, reuse across a whole
+        up/rm pass instead of one API call per runner."""
+        value, good_until = cache
+        if refresh or value is None or time.time() > good_until:
+            value = api("POST", "{}/actions/runners/{}-token".format(self.scope, kind),
+                        self.token)["token"]
+            good_until = time.time() + 45 * 60
+        return value, (value, good_until)
+
     def reg_token(self, refresh=False):
         if self.manual:
             if self._reg is None or refresh:
                 self._reg = self._prompt("registration", self._settings_page() + "/new")
             return self._reg
-        return api("POST", self.scope + "/actions/runners/registration-token",
-                   self.token)["token"]
+        token, self._reg_cache = self._minted(self._reg_cache, "registration", refresh)
+        return token
 
     def rem_token(self, refresh=False):
         if self.manual:
             if self._rem is None or refresh:
                 self._rem = self._prompt("removal", self._settings_page())
             return self._rem
-        return api("POST", self.scope + "/actions/runners/remove-token",
-                   self.token)["token"]
+        token, self._rem_cache = self._minted(self._rem_cache, "remove", refresh)
+        return token
 
     def runners(self):
         """name -> API entry for every runner registered at this scope."""
@@ -376,6 +424,67 @@ def runner_dir(cfg, i):
     return os.path.join(cfg.base_dir, "{}{}".format(cfg.dir_prefix, i))
 
 
+def state_dir(cfg):
+    # namespaced by pool name so pools sharing a base_dir (with distinct
+    # dir_prefix) get independent supervisors and markers
+    return os.path.join(cfg.base_dir, ".runnerctl", cfg.name)
+
+
+def daemon_pidfile(cfg):
+    return os.path.join(state_dir(cfg), "daemon.pid")
+
+
+def daemon_logfile(cfg):
+    return os.path.join(state_dir(cfg), "daemon.log")
+
+
+def child_pidfile(cfg, i):
+    return os.path.join(state_dir(cfg), "pids", "{}.pid".format(i))
+
+
+def disabled_marker(cfg, i):
+    return os.path.join(state_dir(cfg), "disabled", str(i))
+
+
+def runner_logfile(cfg, i):
+    return os.path.join(runner_dir(cfg, i), "runner.log")
+
+
+def read_pid(path):
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def pid_alive(pid):
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def kill_process_group(pid):
+    """Graceful escalation against a runner's process group (pgid == pid,
+    children are spawned with start_new_session)."""
+    for sig, patience in ((signal.SIGINT, 30), (signal.SIGTERM, 10), (signal.SIGKILL, 5)):
+        try:
+            os.killpg(pid, sig)
+        except ProcessLookupError:
+            return
+        deadline = time.time() + patience
+        while time.time() < deadline and pid_alive(pid):
+            time.sleep(0.5)
+        if not pid_alive(pid):
+            return
+
+
 def registered_name(cfg, i):
     path = os.path.join(runner_dir(cfg, i), ".runner")
     if not os.path.isfile(path):
@@ -400,7 +509,11 @@ def local_indices(cfg):
 
 
 def default_name(cfg, i):
-    return "{}-{}".format(cfg.name_prefix, i)
+    # the default pool keeps plain <host>-<N> names (adoption-friendly);
+    # named pools include the pool name to avoid cross-pool collisions
+    if cfg.name == "default":
+        return "{}-{}".format(cfg.name_prefix, i)
+    return "{}-{}-{}".format(cfg.name_prefix, cfg.name, i)
 
 
 # ---------------------------------------------------------------- runner package
@@ -438,55 +551,201 @@ def ensure_tarball(cfg, version):
     return path
 
 
-# ---------------------------------------------------------------- process managers
+# ---------------------------------------------------------------- supervisor daemon
 
-class SystemdManager:
-    kind = "systemd"
+class Supervisor:
+    """The `runnerctl daemon` runtime: owns every runner process as a direct
+    child, restarts each independently with exponential backoff, and re-reads
+    desired state (registered runner dirs minus disabled markers) on SIGHUP.
+    Holds no GitHub credentials and performs no registration work."""
+
+    POLL = 1.0
+    QUICK_DEATH = 60.0
 
     def __init__(self, cfg):
         self.cfg = cfg
+        self.children = {}     # idx -> subprocess.Popen
+        self.started = {}      # idx -> spawn timestamp
+        self.failures = {}     # idx -> consecutive quick-death count
+        self.next_start = {}   # idx -> earliest allowed restart time
+        self.want_reload = True
+        self.stopping = False
 
     @staticmethod
-    def available():
-        if not shutil.which("systemctl"):
-            return False
-        p = run(["systemctl", "--user", "is-system-running"])
-        state = (p.stdout or "").strip().splitlines()
-        state = state[0] if state else ""
-        return state in ("running", "degraded", "starting", "initializing", "maintenance")
+    def log(msg):
+        print("{} {}".format(time.strftime("%Y-%m-%dT%H:%M:%S"), msg), flush=True)
 
-    def unit(self, i):
-        return UNIT_NAME.format(i)
+    def desired(self):
+        out = []
+        for i in local_indices(self.cfg):
+            d = runner_dir(self.cfg, i)
+            if not os.path.isfile(os.path.join(d, "run.sh")):
+                continue
+            if not os.path.isfile(os.path.join(d, ".runner")):
+                continue
+            if os.path.exists(disabled_marker(self.cfg, i)):
+                continue
+            out.append(i)
+        return out
 
-    def setup(self):
-        body = (
+    def spawn(self, i):
+        d = runner_dir(self.cfg, i)
+        with open(runner_logfile(self.cfg, i), "ab") as logf:
+            p = subprocess.Popen([os.path.join(d, "run.sh")], cwd=d,
+                                 stdout=logf, stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL, start_new_session=True)
+        self.children[i] = p
+        self.started[i] = time.time()
+        os.makedirs(os.path.dirname(child_pidfile(self.cfg, i)), exist_ok=True)
+        with open(child_pidfile(self.cfg, i), "w") as f:
+            f.write(str(p.pid))
+        self.log("runner {}: started (pid {})".format(i, p.pid))
+
+    def stop_child(self, i):
+        p = self.children.pop(i, None)
+        if p is None:
+            return
+        self.log("runner {}: stopping (pid {})".format(i, p.pid))
+        # own children must be reaped via wait(), not probed with kill-0:
+        # an exited child stays a zombie (kill-0 true) until waited on
+        for sig, patience in ((signal.SIGINT, 30), (signal.SIGTERM, 10), (signal.SIGKILL, 5)):
+            try:
+                os.killpg(p.pid, sig)
+            except ProcessLookupError:
+                break
+            try:
+                p.wait(timeout=patience)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        p.poll()
+        try:
+            os.remove(child_pidfile(self.cfg, i))
+        except OSError:
+            pass
+
+    def reap(self):
+        for i, p in list(self.children.items()):
+            rc = p.poll()
+            if rc is None:
+                continue
+            del self.children[i]
+            try:
+                os.remove(child_pidfile(self.cfg, i))
+            except OSError:
+                pass
+            quick = time.time() - self.started.get(i, 0) < self.QUICK_DEATH
+            self.failures[i] = self.failures.get(i, 0) + 1 if quick else 0
+            delay = min(5 * (2 ** self.failures[i]), 300) if self.failures[i] else 2
+            self.next_start[i] = time.time() + delay
+            self.log("runner {}: exited rc={}; restart in {:.0f}s".format(i, rc, delay))
+
+    def run(self):
+        old = read_pid(daemon_pidfile(self.cfg))
+        if pid_alive(old):
+            raise Err("daemon already running (pid {})".format(old))
+        for sub in ("pids", "disabled"):
+            os.makedirs(os.path.join(state_dir(self.cfg), sub), exist_ok=True)
+        with open(daemon_pidfile(self.cfg), "w") as f:
+            f.write(str(os.getpid()))
+
+        def on_hup(signum, frame):
+            self.want_reload = True
+
+        def on_stop(signum, frame):
+            self.stopping = True
+
+        signal.signal(signal.SIGHUP, on_hup)
+        signal.signal(signal.SIGTERM, on_stop)
+        signal.signal(signal.SIGINT, on_stop)
+        self.log("supervisor started (pid {}, base {})".format(os.getpid(), self.cfg.base_dir))
+        try:
+            while not self.stopping:
+                if self.want_reload:
+                    self.want_reload = False
+                    self.log("rescanning pool state")
+                want = self.desired()
+                for i in list(self.children):
+                    if i not in want:
+                        self.stop_child(i)
+                self.reap()
+                now = time.time()
+                for i in want:
+                    if i not in self.children and now >= self.next_start.get(i, 0):
+                        self.spawn(i)
+                time.sleep(self.POLL)
+        finally:
+            self.log("supervisor stopping; shutting down {} runner(s)".format(len(self.children)))
+            for i in list(self.children):
+                self.stop_child(i)
+            try:
+                os.remove(daemon_pidfile(self.cfg))
+            except OSError:
+                pass
+            self.log("supervisor exited")
+
+
+def systemd_user_available():
+    if not shutil.which("systemctl"):
+        return False
+    p = run(["systemctl", "--user", "is-system-running"])
+    state = (p.stdout or "").strip().splitlines()
+    state = state[0] if state else ""
+    return state in ("running", "degraded", "starting", "initializing", "maintenance")
+
+
+class DaemonController:
+    """Hosts and signals the supervisor: one user-level systemd service when a
+    user bus exists, otherwise a detached process (survives logout via its own
+    session; not resurrected after reboot)."""
+
+    def __init__(self, cfg, announce=False):
+        self.cfg = cfg
+        if cfg.manager == "systemd":
+            if not systemd_user_available():
+                raise Err("manager=systemd but the systemd user bus is unavailable "
+                          '(set manager = "nohup" in {})'.format(cfg.path))
+            self.mode = "systemd"
+        elif cfg.manager == "nohup":
+            self.mode = "detached"
+        else:
+            self.mode = "systemd" if systemd_user_available() else "detached"
+            if announce and self.mode == "detached":
+                warn("systemd user bus unavailable; hosting the supervisor as a "
+                     "detached process (runners still restart on crash; the "
+                     "supervisor itself is not resurrected after reboot)")
+
+    def pid(self):
+        return read_pid(daemon_pidfile(self.cfg))
+
+    def running(self):
+        return pid_alive(self.pid())
+
+    def _script(self):
+        return os.path.realpath(os.path.abspath(sys.argv[0]))
+
+    def _unit_body(self):
+        return (
             "# managed by runnerctl\n"
             "[Unit]\n"
-            "Description=GitHub Actions runner %i (runnerctl)\n"
+            "Description=runnerctl - GitHub Actions runner pool supervisor\n"
             "After=network-online.target\n"
             "\n"
             "[Service]\n"
-            "WorkingDirectory={base}/{prefix}%i\n"
-            "ExecStart={base}/{prefix}%i/run.sh\n"
+            "ExecStart={script} -c {config} daemon\n"
+            "ExecReload=/bin/kill -HUP $MAINPID\n"
             "Restart=always\n"
-            "RestartSec=10\n"
-            "KillSignal=SIGINT\n"
-            "TimeoutStopSec=90\n"
+            "RestartSec=5\n"
+            "KillSignal=SIGTERM\n"
+            "TimeoutStopSec=150\n"
             "\n"
             "[Install]\n"
             "WantedBy=default.target\n"
-        ).format(base=self.cfg.base_dir, prefix=self.cfg.dir_prefix)
-        current = None
-        if os.path.isfile(UNIT_PATH):
-            with open(UNIT_PATH) as f:
-                current = f.read()
-        if current != body:
-            os.makedirs(os.path.dirname(UNIT_PATH), exist_ok=True)
-            with open(UNIT_PATH, "w") as f:
-                f.write(body)
-            run(["systemctl", "--user", "daemon-reload"])
-            info("installed user unit {}".format(UNIT_PATH))
-        self._ensure_linger()
+        ).format(script=self._script(), config=os.path.realpath(self.cfg.path))
+
+    def _unit_active(self):
+        p = run(["systemctl", "--user", "is-active", unit_name(self.cfg)])
+        return (p.stdout or "").strip() == "active"
 
     def _ensure_linger(self):
         user = getpass.getuser()
@@ -495,137 +754,127 @@ class SystemdManager:
             return
         q = run(["loginctl", "enable-linger", user])
         if q.returncode == 0:
-            ok("enabled session linger (runners survive logout)")
+            ok("enabled session linger (supervisor survives logout and reboot)")
         else:
-            warn("could not enable linger; runners may stop when your last session ends "
-                 "(an admin can run: loginctl enable-linger {})".format(user))
+            warn("could not enable linger; the supervisor may stop when your last "
+                 "session ends (an admin can run: loginctl enable-linger {})".format(user))
 
-    def start(self, i):
-        run(["systemctl", "--user", "enable", "--now", self.unit(i)], check=True)
+    def ensure(self):
+        os.makedirs(state_dir(self.cfg), exist_ok=True)
+        if self.mode == "systemd":
+            if self.running() and not self._unit_active():
+                info("stopping leftover detached supervisor before systemd takeover")
+                self._stop_detached()
+            body = self._unit_body()
+            upath = unit_path(self.cfg)
+            current = None
+            if os.path.isfile(upath):
+                with open(upath) as f:
+                    current = f.read()
+            if current != body:
+                os.makedirs(os.path.dirname(upath), exist_ok=True)
+                with open(upath, "w") as f:
+                    f.write(body)
+                run(["systemctl", "--user", "daemon-reload"])
+                info("installed user unit {}".format(upath))
+                if self._unit_active():
+                    info("unit changed; restarting supervisor")
+                    run(["systemctl", "--user", "restart", unit_name(self.cfg)], check=True)
+            self._ensure_linger()
+            if not self._unit_active():
+                run(["systemctl", "--user", "enable", "--now", unit_name(self.cfg)], check=True)
+                self._wait_running()
+                info("supervisor started (systemd user service {})".format(unit_name(self.cfg)))
+        else:
+            if self.running():
+                return
+            with open(daemon_logfile(self.cfg), "ab") as logf:
+                subprocess.Popen(
+                    [self._script(), "-c", os.path.realpath(self.cfg.path), "daemon"],
+                    stdout=logf, stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL, start_new_session=True)
+            self._wait_running()
+            info("supervisor started (detached, pid {})".format(self.pid()))
 
-    def stop(self, i):
-        run(["systemctl", "--user", "disable", "--now", self.unit(i)])
+    def _wait_running(self, timeout=10):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.running():
+                return
+            time.sleep(0.2)
+        raise Err("supervisor did not come up; check `runnerctl logs --daemon`")
 
-    def restart(self, i):
-        run(["systemctl", "--user", "restart", self.unit(i)], check=True)
+    def hup(self):
+        pid = self.pid()
+        if pid_alive(pid):
+            os.kill(pid, signal.SIGHUP)
 
-    def state(self, i):
-        p = run(["systemctl", "--user", "is-active", self.unit(i)])
-        return (p.stdout or "").strip() or "-"
+    def reload_or_start(self):
+        self.ensure()
+        self.hup()
 
-    def logs(self, i, follow):
-        cmd = ["journalctl", "--user", "-u", self.unit(i), "-n", "100", "--no-pager"]
-        if follow:
-            cmd.append("-f")
-        os.execvp(cmd[0], cmd)
+    def _stop_detached(self):
+        pid = self.pid()
+        if not pid_alive(pid):
+            return
+        os.kill(pid, signal.SIGTERM)
+        deadline = time.time() + 150
+        while time.time() < deadline and pid_alive(pid):
+            time.sleep(0.5)
+        if pid_alive(pid):
+            os.kill(pid, signal.SIGKILL)
+
+    def stop(self):
+        if self.mode == "systemd":
+            run(["systemctl", "--user", "disable", "--now", unit_name(self.cfg)])
+        self._stop_detached()
 
 
-class NohupManager:
-    """Fallback for hosts without a systemd user bus (common on HPC login nodes).
+def wait_child_gone(cfg, i, timeout=90):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not pid_alive(read_pid(child_pidfile(cfg, i))):
+            return True
+        time.sleep(0.5)
+    return False
 
-    Detached process groups with pidfiles; no restart-on-crash.
-    """
-    kind = "nohup"
 
-    def __init__(self, cfg):
-        self.cfg = cfg
-
-    @staticmethod
-    def available():
-        return True
-
-    def setup(self):
+def stop_runner_process(cfg, dc, i, disable=True):
+    """Stop one runner: mark it disabled so the supervisor will not respawn it,
+    let the supervisor bring it down, fall back to killing directly."""
+    if disable:
+        os.makedirs(os.path.dirname(disabled_marker(cfg, i)), exist_ok=True)
+        with open(disabled_marker(cfg, i), "w"):
+            pass
+    if dc.running():
+        dc.hup()
+        if wait_child_gone(cfg, i):
+            return
+        warn("supervisor did not stop runner {} in time; killing directly".format(i))
+    pid = read_pid(child_pidfile(cfg, i))
+    if pid_alive(pid):
+        kill_process_group(pid)
+    try:
+        os.remove(child_pidfile(cfg, i))
+    except OSError:
         pass
 
-    def _pidfile(self, i):
-        return os.path.join(runner_dir(self.cfg, i), ".runnerctl.pid")
 
-    def _logfile(self, i):
-        return os.path.join(runner_dir(self.cfg, i), "runner.log")
-
-    def _pid(self, i):
-        try:
-            with open(self._pidfile(i)) as f:
-                return int(f.read().strip())
-        except (OSError, ValueError):
-            return None
-
-    @staticmethod
-    def _alive(pid):
-        if pid is None:
-            return False
-        try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-
-    def start(self, i):
-        if self._alive(self._pid(i)):
-            return
-        d = runner_dir(self.cfg, i)
-        script = os.path.join(d, "run.sh")
-        if not os.path.isfile(script):
-            raise Err("no run.sh in {} (not provisioned?)".format(d))
-        with open(self._logfile(i), "ab") as logf:
-            p = subprocess.Popen([script], cwd=d, stdout=logf, stderr=subprocess.STDOUT,
-                                 stdin=subprocess.DEVNULL, start_new_session=True)
-        with open(self._pidfile(i), "w") as f:
-            f.write(str(p.pid))
-
-    def stop(self, i):
-        pid = self._pid(i)
-        if not self._alive(pid):
-            self._cleanup(i)
-            return
-        for sig, patience in ((signal.SIGINT, 30), (signal.SIGTERM, 10), (signal.SIGKILL, 5)):
-            try:
-                os.killpg(pid, sig)
-            except ProcessLookupError:
-                break
-            deadline = time.time() + patience
-            while time.time() < deadline and self._alive(pid):
-                time.sleep(0.5)
-            if not self._alive(pid):
-                break
-        self._cleanup(i)
-
-    def _cleanup(self, i):
-        try:
-            os.remove(self._pidfile(i))
-        except OSError:
-            pass
-
-    def restart(self, i):
-        self.stop(i)
-        self.start(i)
-
-    def state(self, i):
-        return "active" if self._alive(self._pid(i)) else "inactive"
-
-    def logs(self, i, follow):
-        logf = self._logfile(i)
-        if not os.path.isfile(logf):
-            raise Err("no log file yet: {}".format(logf))
-        cmd = ["tail", "-n", "100"] + (["-f"] if follow else []) + [logf]
-        os.execvp(cmd[0], cmd)
+def enable_runner(cfg, i):
+    try:
+        os.remove(disabled_marker(cfg, i))
+    except OSError:
+        pass
 
 
-def pick_manager(cfg, announce=False):
-    if cfg.manager == "systemd":
-        if not SystemdManager.available():
-            raise Err("manager=systemd but the systemd user bus is unavailable "
-                      '(set manager = "nohup" in {})'.format(cfg.path))
-        return SystemdManager(cfg)
-    if cfg.manager == "nohup":
-        return NohupManager(cfg)
-    if SystemdManager.available():
-        return SystemdManager(cfg)
-    if announce:
-        warn("systemd user bus unavailable; using nohup manager (no restart-on-crash)")
-    return NohupManager(cfg)
+def runner_state(cfg, i, daemon_up):
+    if os.path.exists(disabled_marker(cfg, i)):
+        return "stopped"
+    if pid_alive(read_pid(child_pidfile(cfg, i))):
+        return "running"
+    if daemon_up:
+        return "pending"
+    return "down"
 
 
 # ---------------------------------------------------------------- pool operations
@@ -663,14 +912,14 @@ def provision(cfg, i, gh, tarball):
     ok("registered {}".format(name))
 
 
-def decommission(cfg, i, gh, mgr, remote, force):
+def decommission(cfg, i, gh, dc, remote, force):
     d = runner_dir(cfg, i)
     name = registered_name(cfg, i) or default_name(cfg, i)
     entry = remote.get(name)
     if entry and entry.get("busy") and not force:
         warn("{} is running a job; skipped (re-run with --force to kill it)".format(name))
         return False
-    mgr.stop(i)
+    stop_runner_process(cfg, dc, i)
     if registered_name(cfg, i):
         refresh = False
         while True:
@@ -692,8 +941,26 @@ def decommission(cfg, i, gh, mgr, remote, force):
                      "deleting the directory anyway".format(name))
             break
     shutil.rmtree(d, ignore_errors=True)
+    enable_runner(cfg, i)  # a future runner with this index starts clean
+    try:
+        os.remove(child_pidfile(cfg, i))
+    except OSError:
+        pass
     ok("removed runner {} ({})".format(i, name))
     return True
+
+
+def fetch_busy(cfg, purpose):
+    """Best-effort busy map for guards; empty when no token is available."""
+    gh = GitHub(cfg)
+    if gh.manual:
+        gh.warn_manual("cannot check busy state before {}".format(purpose))
+        return {}
+    try:
+        return {n: e for n, e in gh.runners().items() if e.get("busy")}
+    except Err as e:
+        warn(str(e))
+        return {}
 
 
 # ---------------------------------------------------------------- commands
@@ -708,58 +975,56 @@ def cmd_init(dest):
 
 def cmd_up(cfg, count=None, force=False):
     gh = GitHub(cfg)
-    mgr = pick_manager(cfg, announce=True)
-    mgr.setup()
+    dc = DaemonController(cfg, announce=True)
     target = cfg.count if count is None else count
     if target < 0:
         raise Err("count must be >= 0")
     if count is not None and count != cfg.count:
-        info("converging to {} (config says {}; edit {} to persist)".format(
-            count, cfg.count, cfg.path))
+        info("converging to {} for this run (config says {}; "
+             "`runnerctl scale {}` makes it permanent)".format(count, cfg.count, count))
     tarball = None
     for i in range(1, target + 1):
         if not registered_name(cfg, i):
             if tarball is None:
                 tarball = ensure_tarball(cfg, resolve_version(cfg, gh))
             provision(cfg, i, gh, tarball)
-        if mgr.state(i) != "active":
-            mgr.start(i)
-            info("started runner {}".format(i))
+        enable_runner(cfg, i)  # up means: everything in range runs
     extra = [i for i in local_indices(cfg) if i > target]
     if extra:
         if gh.manual:
-            gh.warn_manual("cannot check busy state; surplus runners are "
-                           "stopped and removed as-is")
+            gh.warn_manual("cannot check busy state; surplus runners are removed as-is")
         remote = gh.runners()
         for i in sorted(extra, reverse=True):
-            decommission(cfg, i, gh, mgr, remote, force)
+            decommission(cfg, i, gh, dc, remote, force)
+    if target > 0 or dc.running():
+        dc.reload_or_start()
     ok("pool converged to {} runner(s)".format(target))
     cmd_status(cfg)
 
 
+def cmd_scale(cfg, n, force=False):
+    if n < 0:
+        raise Err("count must be >= 0")
+    if n != cfg.count:
+        rewrite_count(cfg, n)
+        cfg = load_config(cfg.path)
+    cmd_up(cfg, None, force)
+
+
 def cmd_down(cfg, force=False):
-    mgr = pick_manager(cfg)
-    gh = GitHub(cfg)
-    remote = {}
-    if gh.manual:
-        gh.warn_manual("cannot check busy state before stopping")
-    else:
-        try:
-            remote = gh.runners()
-        except Err as e:
-            warn(str(e))
-    stopped = 0
-    for i in local_indices(cfg):
-        name = registered_name(cfg, i)
-        entry = remote.get(name) if name else None
-        if entry and entry.get("busy") and not force:
-            warn("{} is running a job; left running (use --force)".format(name))
-            continue
-        was_active = mgr.state(i) == "active"
-        mgr.stop(i)
-        if was_active:
-            stopped += 1
-    ok("stopped {} runner(s); registrations kept (`runnerctl up` resumes)".format(stopped))
+    dc = DaemonController(cfg)
+    if not dc.running() and dc.mode == "detached":
+        ok("supervisor already stopped")
+        return
+    if not force:
+        busy = fetch_busy(cfg, "stopping the pool")
+        blockers = [n for i in local_indices(cfg)
+                    for n in [registered_name(cfg, i)] if n and n in busy]
+        if blockers:
+            raise Err("busy runner(s): {} — retry with --force to kill their "
+                      "jobs, or wait".format(", ".join(blockers)))
+    dc.stop()
+    ok("supervisor stopped; registrations kept (`runnerctl up` resumes)")
 
 
 def cmd_rm(cfg, indices, all_flag, force):
@@ -771,14 +1036,16 @@ def cmd_rm(cfg, indices, all_flag, force):
     if bad:
         raise Err("no such runner(s): {}".format(", ".join(map(str, bad))))
     gh = GitHub(cfg)
-    mgr = pick_manager(cfg)
+    dc = DaemonController(cfg)
     if gh.manual:
         gh.warn_manual("cannot check busy state before removal")
     remote = gh.runners()
     removed = []
     for i in sorted(targets, reverse=True):
-        if decommission(cfg, i, gh, mgr, remote, force):
+        if decommission(cfg, i, gh, dc, remote, force):
             removed.append(i)
+    if dc.running():
+        dc.hup()
     still_wanted = [i for i in removed if i <= cfg.count]
     if still_wanted:
         warn("config still wants count={}; the next `runnerctl up` will "
@@ -786,38 +1053,38 @@ def cmd_rm(cfg, indices, all_flag, force):
 
 
 def cmd_svc(cfg, action, indices, force=False):
-    have = local_indices(cfg)
+    have = [i for i in local_indices(cfg) if registered_name(cfg, i)]
     if not have:
-        raise Err("no runners provisioned; run `runnerctl up`")
+        raise Err("no registered runners; run `runnerctl up`")
     targets = sorted(set(indices)) if indices else have
     bad = [i for i in targets if i not in have]
     if bad:
         raise Err("no such runner(s): {}".format(", ".join(map(str, bad))))
-    mgr = pick_manager(cfg, announce=True)
-    if action in ("start", "restart"):
-        mgr.setup()
+    dc = DaemonController(cfg, announce=True)
     busy = {}
     if action in ("stop", "restart") and not force:
-        gh = GitHub(cfg)
-        if gh.manual:
-            gh.warn_manual("cannot check busy state")
-        else:
-            try:
-                busy = {n: e for n, e in gh.runners().items() if e.get("busy")}
-            except Err as e:
-                warn(str(e))
-    past = {"start": "started", "stop": "stopped", "restart": "restarted"}[action]
+        busy = fetch_busy(cfg, action + "ping" if action == "stop" else "restarting")
     for i in targets:
         name = registered_name(cfg, i)
         if name and name in busy:
             warn("{} is running a job; skipped (use --force)".format(name))
             continue
-        getattr(mgr, action)(i)
-        ok("{} runner {}".format(past, i))
+        if action in ("stop", "restart"):
+            stop_runner_process(cfg, dc, i)
+            if action == "stop":
+                ok("stopped runner {}".format(i))
+        if action in ("start", "restart"):
+            enable_runner(cfg, i)
+            ok("{} runner {}".format("restarted" if action == "restart" else "started", i))
+    if action in ("start", "restart"):
+        dc.reload_or_start()
+    elif dc.running():
+        dc.hup()
 
 
 def cmd_status(cfg):
-    mgr = pick_manager(cfg)
+    dc = DaemonController(cfg)
+    daemon_up = dc.running()
     gh = GitHub(cfg)
     remote, api_err = {}, None
     if gh.manual:
@@ -829,12 +1096,18 @@ def cmd_status(cfg):
             api_err = str(e)
     have = local_indices(cfg)
     indices = sorted(set(have) | set(range(1, cfg.count + 1)))
+    dstate = ("running (pid {}, {})".format(dc.pid(), dc.mode) if daemon_up
+              else "stopped")
     print()
-    print("{} {}   manager={}   base={}   config: count={}".format(
-        paint("pool", BOLD), cfg.url, mgr.kind, cfg.base_dir, cfg.count))
+    print("{} {} ({})   base={}   config: count={}".format(
+        paint("pool", BOLD), cfg.name, cfg.url, cfg.base_dir, cfg.count))
+    print("{} {}".format(paint("supervisor", BOLD),
+                         paint(dstate, GREEN if daemon_up else RED)))
+    if not daemon_up and have:
+        warn("supervisor not running — `runnerctl up` starts it")
     if api_err:
         warn("GitHub side unavailable: " + api_err)
-    rows = [[("IDX", None), ("NAME", None), ("SERVICE", None),
+    rows = [[("IDX", None), ("NAME", None), ("RUNNER", None),
              ("GITHUB", None), ("JOB", None), ("", None)]]
     matched = set()
     for i in indices:
@@ -846,7 +1119,7 @@ def cmd_status(cfg):
                          ("-", DIM), ("-", DIM), ("not provisioned (runnerctl up)", DIM)])
             continue
         display = name or default_name(cfg, i)
-        svc = mgr.state(i)
+        svc = runner_state(cfg, i, daemon_up)
         if name:
             matched.add(name)
             entry = remote.get(name)
@@ -865,7 +1138,7 @@ def cmd_status(cfg):
         rows.append([
             (str(i), None),
             (display, None),
-            (svc, {"active": GREEN, "failed": RED}.get(svc, DIM)),
+            (svc, {"running": GREEN, "pending": YELLOW, "down": RED}.get(svc, DIM)),
             (gh_state, {"online": GREEN, "offline": RED,
                         "unregistered": YELLOW, "unconfigured": YELLOW}.get(gh_state, DIM)),
             (job, {"busy": YELLOW, "idle": GREEN}.get(job, DIM)),
@@ -899,7 +1172,19 @@ def cmd_status(cfg):
     print()
 
 
-def cmd_logs(cfg, idx, follow):
+def cmd_logs(cfg, idx, follow, daemon):
+    if daemon:
+        dc = DaemonController(cfg)
+        if dc.mode == "systemd":
+            cmd = ["journalctl", "--user", "-u", unit_name(cfg), "-n", "100", "--no-pager"]
+            if follow:
+                cmd.append("-f")
+            os.execvp(cmd[0], cmd)
+        logf = daemon_logfile(cfg)
+        if not os.path.isfile(logf):
+            raise Err("no supervisor log yet: {}".format(logf))
+        cmd = ["tail", "-n", "100"] + (["-f"] if follow else []) + [logf]
+        os.execvp(cmd[0], cmd)
     have = local_indices(cfg)
     if not have:
         raise Err("no runners provisioned; run `runnerctl up`")
@@ -910,17 +1195,21 @@ def cmd_logs(cfg, idx, follow):
             raise Err("multiple runners; pick one: runnerctl logs <idx>")
     if idx not in have:
         raise Err("no such runner: {}".format(idx))
-    pick_manager(cfg).logs(idx, follow)
+    logf = runner_logfile(cfg, idx)
+    if not os.path.isfile(logf):
+        raise Err("no log yet for runner {}: {}".format(idx, logf))
+    cmd = ["tail", "-n", "100"] + (["-f"] if follow else []) + [logf]
+    os.execvp(cmd[0], cmd)
 
 
 def cmd_config(cfg):
-    mgr = pick_manager(cfg)
+    dc = DaemonController(cfg)
     print("config file: {}".format(cfg.path))
-    for key in ("url", "count", "labels", "base_dir", "version",
+    for key in ("name", "url", "count", "labels", "base_dir", "version",
                 "name_prefix", "manager", "group", "dir_prefix"):
         val = getattr(cfg, key)
         shown = val if isinstance(val, str) else json.dumps(val)
-        extra = "  (resolves to: {})".format(mgr.kind) if key == "manager" and val == "auto" else ""
+        extra = "  (resolves to: {})".format(dc.mode) if key == "manager" and val == "auto" else ""
         print("  {} = {}{}".format(key, shown, extra))
 
 
@@ -930,7 +1219,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="runnerctl",
         description="Sudoless, config-driven pool manager for self-hosted "
-                    "GitHub Actions runners.")
+                    "GitHub Actions runners. One supervisor service owns all "
+                    "runner processes.")
     ap.add_argument("-c", "--config", metavar="FILE",
                     help="config file (default: ./runners.toml, "
                          "~/.config/runnerctl/runners.toml)")
@@ -939,34 +1229,38 @@ def main(argv=None):
 
     sub.add_parser("init", help="write a starter runners.toml here")
     p = sub.add_parser("up", help="converge the pool to the config "
-                                  "(provision, register, start, prune)")
+                                  "(provision, register, supervise, prune)")
     p.add_argument("--count", type=int, metavar="N",
-                   help="override the configured count for this run")
+                   help="override the configured count for this run only")
     p.add_argument("--force", action="store_true",
                    help="prune surplus runners even if busy")
-    p = sub.add_parser("scale", help="converge to exactly N runners (up --count N)")
+    p = sub.add_parser("scale", help="set count = N in the config and converge")
     p.add_argument("n", type=int)
     p.add_argument("--force", action="store_true")
     sub.add_parser("status", aliases=["ps"],
-                   help="show pool status (local dirs + services + GitHub)")
-    p = sub.add_parser("down", help="stop all runners; keep registrations")
+                   help="show pool status (supervisor + runners + GitHub)")
+    p = sub.add_parser("down", help="stop the supervisor and all runners; "
+                                    "keep registrations")
     p.add_argument("--force", action="store_true", help="stop even busy runners")
     p = sub.add_parser("rm", help="deregister and delete runners")
     p.add_argument("idx", nargs="*", type=int)
     p.add_argument("--all", action="store_true")
     p.add_argument("--force", action="store_true")
-    for name, hlp in (("start", "start runner services"),
-                      ("stop", "stop runner services"),
-                      ("restart", "restart runner services")):
+    for name, hlp in (("start", "start runners (clear their stopped mark)"),
+                      ("stop", "stop runners (kept registered, not respawned)"),
+                      ("restart", "restart runners")):
         p = sub.add_parser(name, help=hlp)
         p.add_argument("idx", nargs="*", type=int)
         if name in ("stop", "restart"):
             p.add_argument("--force", action="store_true",
                            help="proceed even if the runner is busy")
-    p = sub.add_parser("logs", help="show a runner's logs")
+    p = sub.add_parser("logs", help="show a runner's (or the supervisor's) logs")
     p.add_argument("idx", nargs="?", type=int)
     p.add_argument("-f", "--follow", action="store_true")
+    p.add_argument("--daemon", action="store_true", help="supervisor log instead")
     sub.add_parser("config", help="print the resolved configuration")
+    sub.add_parser("daemon", help="run the supervisor in the foreground "
+                                  "(normally started for you by `up`)")
 
     args = ap.parse_args(argv)
     try:
@@ -977,7 +1271,7 @@ def main(argv=None):
         if args.cmd == "up":
             cmd_up(cfg, args.count, args.force)
         elif args.cmd == "scale":
-            cmd_up(cfg, args.n, args.force)
+            cmd_scale(cfg, args.n, args.force)
         elif args.cmd in ("status", "ps"):
             cmd_status(cfg)
         elif args.cmd == "down":
@@ -987,9 +1281,11 @@ def main(argv=None):
         elif args.cmd in ("start", "stop", "restart"):
             cmd_svc(cfg, args.cmd, args.idx, getattr(args, "force", False))
         elif args.cmd == "logs":
-            cmd_logs(cfg, args.idx, args.follow)
+            cmd_logs(cfg, args.idx, args.follow, args.daemon)
         elif args.cmd == "config":
             cmd_config(cfg)
+        elif args.cmd == "daemon":
+            Supervisor(cfg).run()
     except Err as e:
         print(paint("error:", RED) + " " + str(e), file=sys.stderr)
         return 1

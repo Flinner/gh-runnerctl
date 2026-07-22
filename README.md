@@ -6,13 +6,14 @@ One Python file, standard library only, docker-style CLI.
 ```console
 $ runnerctl status
 
-pool https://github.com/my-org   manager=systemd   base=/home/me/actions-runner   config: count=4
+pool default (https://github.com/my-org)   base=/home/me/actions-runner   config: count=4
+supervisor running (pid 71324, systemd)
 
-  IDX  NAME       SERVICE   GITHUB   JOB
-  1    node1-1    active    online   idle
-  2    node1-2    active    online   busy
-  3    node1-3    active    online   idle
-  4    node1-4    active    online   idle
+  IDX  NAME       RUNNER    GITHUB   JOB
+  1    node1-1    running   online   idle
+  2    node1-2    running   online   busy
+  3    node1-3    running   online   idle
+  4    node1-4    running   online   idle
 ```
 
 Declare the pool once in `runners.toml`; `runnerctl up` converges the host to it —
@@ -30,9 +31,12 @@ Every existing multi-runner tool assumes root, Docker, or Kubernetes.
 `runnerctl` targets the host where you have none of those — an HPC login node, a
 shared lab workstation, a locked-down VM:
 
-- **No sudo, ever.** Services are *user-level* systemd units (with automatic
-  session linger), and on hosts where the systemd user bus is disabled it falls
-  back to a detached-process manager transparently.
+- **No sudo, ever.** `runnerctl` itself is the one service: a single
+  *user-level* systemd unit (with automatic session linger) runs the
+  `runnerctl daemon` supervisor, which owns every runner process as a child
+  and restarts each independently with backoff. On hosts where the systemd
+  user bus is disabled the same supervisor runs as a detached process —
+  identical behavior, including per-runner crash restarts.
 - **No dependencies.** One file, Python 3.6+ stdlib. `curl`-and-run install.
 - **No PAT required.** Works best with a token (`GITHUB_TOKEN` or a logged-in
   `gh` CLI), but degrades to an interactive flow that prompts you to paste
@@ -66,29 +70,47 @@ queued jobs across the runners automatically.
 
 | Key | Default | Meaning |
 |---|---|---|
+| `name` | `default` | Pool identity; names the supervisor service and its state |
 | `url` | — | Org URL (`https://github.com/my-org`) or repo URL (`.../owner/repo`) |
 | `count` | `2` | Desired number of runners; `up` converges both directions |
 | `labels` | `["self-hosted"]` | Runner labels |
 | `base_dir` | `~/actions-runner` | Each runner lives in `<base_dir>/<dir_prefix><N>` |
 | `version` | `latest` | Runner release to install, e.g. `"2.335.1"` |
 | `name_prefix` | hostname | GitHub-side runner names `<prefix>-<N>` |
-| `manager` | `auto` | `auto` \| `systemd` \| `nohup` (both sudoless) |
+| `manager` | `auto` | How the supervisor is hosted: `auto` \| `systemd` \| `nohup` (both sudoless) |
 | `group` | — | Runner group (org-level registration only) |
 | `dir_prefix` | `runner` | Directory naming; see *Adopting an existing setup* |
+
+### Multiple pools
+
+One config file = one pool = one supervisor. For several pools on a host
+(different labels, orgs, or repo scopes), write one file per pool with a
+distinct `name` and address each with `-c`:
+
+```console
+$ runnerctl up                      # pool "default" from ./runners.toml
+$ runnerctl -c gpu.toml up          # pool "gpu" -> runnerctl-gpu.service
+$ runnerctl -c gpu.toml status
+```
+
+Pools may share a `base_dir` (give each a distinct `dir_prefix`) or use
+separate ones; supervisors, state, and GitHub-side runner names are
+namespaced per pool either way. See `runners.toml.example`.
 
 ## Commands
 
 | Command | Does |
 |---|---|
 | `init` | Write a starter `runners.toml` |
-| `up [--count N] [--force]` | Converge the pool to the config (provision, register, start, prune) |
-| `scale N` | `up --count N` |
-| `status` / `ps` | Pool table: local directories + service state + GitHub online/busy |
-| `down [--force]` | Stop all runners, keep registrations |
+| `up [--count N] [--force]` | Converge the pool to the config (provision, register, supervise, prune) |
+| `scale N` | Set `count = N` **in the config file** and converge |
+| `status` / `ps` | Pool table: supervisor + runner processes + GitHub online/busy |
+| `down [--force]` | Stop the supervisor and all runners, keep registrations |
 | `rm <idx...> \| --all [--force]` | Deregister and delete runners |
-| `start` / `stop` / `restart [idx...]` | Service control |
-| `logs [idx] [-f]` | Runner logs (journalctl or logfile, per manager) |
+| `start` / `stop` / `restart [idx...]` | Per-runner control (stopped runners stay registered, not respawned) |
+| `logs [idx] [-f]`, `logs --daemon` | Runner logs / supervisor log |
 | `config` | Print the resolved configuration |
+| `daemon` | Run the supervisor in the foreground (started for you by `up`) |
 
 Anything that would kill a running job (`stop`, `rm`, pruning in `up`) checks
 the runner's busy state on GitHub first and skips busy runners unless `--force`.
@@ -119,26 +141,36 @@ count = 4
 their existing GitHub-side names, and simply takes over service management.
 Stop any tmux/nohup copies first — two listeners on one registration conflict.
 
-## Service management details
+## How supervision works
 
-**systemd (default when available).** One template unit,
-`~/.config/systemd/user/gh-runner@.service`, instantiated per runner
-(`gh-runner@1`, `gh-runner@2`, ...): `Restart=always`, `KillSignal=SIGINT` so a
-runner exits cleanly. Session linger is enabled automatically (`loginctl
-enable-linger`) so runners survive logout and reboot — no root at any step.
+`runnerctl` is the service — runners never touch systemd themselves.
 
-**nohup fallback.** Some hosts (typically HPC login nodes) disable the systemd
-user bus. `manager = "auto"` detects this and falls back to detached process
-groups with pidfiles (`.runnerctl.pid`) and per-runner logfiles (`runner.log`).
-Same CLI, no restart-on-crash.
+**The supervisor** (`runnerctl daemon`) owns every runner's `run.sh` as a
+direct child: it respawns a crashed runner with exponential backoff (without
+disturbing its siblings), re-reads desired state on `SIGHUP` (sent by
+`up`/`scale`/`start`/`stop`), and shuts every runner down cleanly on
+`SIGTERM`. It holds no GitHub credentials — registration, busy checks, and
+the interactive token flow all happen in the CLI commands, so the daemon can
+run headless forever.
+
+**Hosting the supervisor.** With a systemd user bus (default), `up` installs
+a single user unit `runnerctl-<name>.service` (`Restart=always`,
+`ExecReload` = HUP) and enables session linger (`loginctl enable-linger`), so
+the pool survives logout and reboot — no root at any step. On hosts where the
+user bus is disabled (typical HPC login nodes), the same supervisor runs as a
+detached process with a pidfile: per-runner crash restarts still work; only
+the supervisor itself isn't resurrected after a reboot (re-run `runnerctl up`).
+
+Per-runner logs always land in `<runner dir>/runner.log`; the supervisor's
+own log is in the journal (systemd) or `.runnerctl/<name>/daemon.log`.
 
 ## Comparison
 
 | | root/sudo | deps | declarative `scale` | GitHub-side status | no-token fallback |
 |---|---|---|---|---|---|
 | **gh-runnerctl** | no | none | yes | yes | yes |
-| vbem/multi-runners | required | bash+jq | no (imperative add/del) | no | no |
-| gershnik/multi-gh-action-runner | no | Python | config edit + restart | no | no |
+| vbem/multi-runners | required (sudoers, user-per-runner) | bash+jq | no (imperative add/del) | no (`status` unimplemented) | no |
+| gershnik/multi-gh-action-runner | sudo to install daemon | Python+PyGithub | config edit + restart; one crash stops the whole pool | no | no |
 | ARC / GARM / docker images | k8s / daemon / docker | heavy | yes (autoscale) | yes | no |
 
 If you have Kubernetes or Docker and want autoscaling, use
