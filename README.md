@@ -1,11 +1,8 @@
 <div align="center">
 
-# gh-runnerctl
+![gh-runnerctl — sudoless, config-driven pools of self-hosted GitHub Actions runners](assets/banner.png)
 
-**Sudoless, config-driven pools of self-hosted GitHub Actions runners —
-on one machine or a whole fleet over ssh.**
-
-One Python file. Standard library only. Nothing to install on remote hosts.
+**One Python file. Standard library only. Nothing to install on remote hosts.**
 
 [![Python](https://img.shields.io/badge/python-3.6%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Version](https://img.shields.io/badge/version-0.4.0-blue)](https://github.com/flinner/gh-runnerctl/blob/main/runnerctl)
