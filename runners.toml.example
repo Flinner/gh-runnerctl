@@ -8,12 +8,14 @@
 # tokens, piped over ssh stdin.
 
 name = "default"                        # instance name -> runnerctl-<name>-<machine>.service
-manager = "auto"                        # how supervisors are hosted: auto | systemd | nohup
+check_updates = "ask"                   # after `status`: ask | always | never (never installs)
 
 [defaults]                              # keys shared by every pool below
 url = "https://github.com/YOUR-ORG"    # org URL (runners serve all repos) or a repo URL
 base_dir = "~/gh-runners"               # runners live in <base_dir>/<dir_prefix><N>
 version = "latest"                      # runner release, e.g. "2.335.1", or "latest"
+manager = "auto"                        # per-machine supervisor hosting: auto | systemd | nohup
+                                        # (override per pool; pools on one machine must agree)
 
 [pool.head]
 host = "user@acclhead1.example.org"     # ssh destination (alias or user@host); "" = this machine

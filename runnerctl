@@ -38,7 +38,7 @@ import urllib.request
 
 from collections import OrderedDict
 
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 RAW_SELF_URL = "https://raw.githubusercontent.com/flinner/gh-runnerctl/main/runnerctl"
 
 API_ROOT = "https://api.github.com"
@@ -48,10 +48,11 @@ AGENT_MODE = False  # set by --agent: invoked over ssh by a control machine
 
 INSTANCE_DEFAULTS = {
     "name": "default",
-    "manager": "auto",
+    "check_updates": "ask",
 }
 
 POOL_DEFAULTS = {
+    "manager": "auto",
     "url": "",
     "count": 2,
     "labels": ["self-hosted"],
@@ -231,11 +232,11 @@ class Pool:
 
 
 class Instance:
-    def __init__(self, name, manager, path):
+    def __init__(self, name, path):
         self.name = name
-        self.manager = manager
         self.path = path
         self.as_host = None
+        self.check_updates = "ask"
         self.pools = OrderedDict()
 
     @property
@@ -332,11 +333,16 @@ def load_config(path):
     inst_name = str(inst_data["name"])
     if not _NAME_RE.match(inst_name):
         raise Err("{}: name must be alphanumeric/dash/underscore".format(path))
-    if inst_data["manager"] not in ("auto", "systemd", "nohup"):
-        raise Err('{}: manager must be "auto", "systemd" or "nohup"'.format(path))
-    inst = Instance(inst_name, inst_data["manager"], path)
+    if inst_data["check_updates"] not in ("ask", "always", "never"):
+        raise Err('{}: check_updates must be "ask", "always" or "never"'.format(path))
+    inst = Instance(inst_name, path)
+    inst.check_updates = inst_data["check_updates"]
 
-    known_top = {"pool", "defaults"} | set(INSTANCE_DEFAULTS)
+    # manager is a pool key ([defaults]-inheritable) since each MACHINE hosts
+    # its own supervisor; a bare top-level `manager` acts as a global default
+    top_manager = doc.get("manager") if not isinstance(doc.get("manager"), dict) else None
+
+    known_top = {"pool", "defaults", "manager"} | set(INSTANCE_DEFAULTS)
     unknown_top = sorted(k for k in doc if k not in known_top)
     if unknown_top:
         warn("{}: ignoring unknown key(s): {}".format(path, ", ".join(unknown_top)))
@@ -355,9 +361,14 @@ def load_config(path):
             warn("{}: [pool.{}] ignoring unknown key(s): {}".format(
                 path, pname, ", ".join(unknown)))
         data = dict(POOL_DEFAULTS)
+        if top_manager is not None:
+            data["manager"] = top_manager
         data.update({k: v for k, v in defaults_tbl.items() if k in POOL_DEFAULTS})
         data.update({k: v for k, v in raw.items() if k in POOL_DEFAULTS})
         where = "[pool]" if pname == "default" and scalars else "[pool.{}]".format(pname)
+        if data["manager"] not in ("auto", "systemd", "nohup"):
+            raise Err('{}: {}: manager must be "auto", "systemd" or "nohup"'.format(
+                path, where))
         if not data["url"] or "YOUR-ORG" in data["url"]:
             raise Err("{}: set `url` in {} (or [defaults])".format(path, where))
         api_scope(data["url"])  # validate shape early
@@ -394,7 +405,21 @@ def load_config(path):
                          path, other, h or "local", pname, data["host"] or "local"))
         seen_dirs[key] = pname
         inst.pools[pname] = Pool(data, pname, inst)
+    by_host = {}
+    for p in inst.pools.values():
+        by_host.setdefault(p.host, set()).add(p.manager)
+    for h, managers in by_host.items():
+        if len(managers) > 1:
+            raise Err("{}: pools on {} disagree on manager ({}) — one machine "
+                      "runs one supervisor".format(
+                          path, h or "this machine", ", ".join(sorted(managers))))
     return inst
+
+
+def local_manager(inst):
+    for p in inst.local_pools():
+        return p.manager
+    return "auto"
 
 
 def scope_instance(inst, host):
@@ -1111,12 +1136,13 @@ class DaemonController:
 
     def __init__(self, inst, announce=False):
         self.inst = inst
-        if inst.manager == "systemd":
+        manager = local_manager(inst)
+        if manager == "systemd":
             if not systemd_user_available():
                 raise Err("manager=systemd but the systemd user bus is unavailable "
                           '(set manager = "nohup" in {})'.format(inst.path))
             self.mode = "systemd"
-        elif inst.manager == "nohup":
+        elif manager == "nohup":
             self.mode = "detached"
         else:
             self.mode = "systemd" if systemd_user_available() else "detached"
@@ -2018,6 +2044,28 @@ def cmd_status(inst):
     print()
 
 
+def maybe_offer_update(inst):
+    """After `status`: check for updates per the check_updates config key
+    ("ask" prompts on a TTY, "always" checks silently, "never" skips)."""
+    if AGENT_MODE or inst.check_updates == "never":
+        return
+    if inst.check_updates == "ask":
+        if not (_tty() and sys.stdin.isatty()):
+            return
+        try:
+            ans = input('check for updates? [y/N]  (set check_updates = '
+                        '"always" or "never" in {} to stop asking) '.format(
+                            inst.path)).strip().lower()
+        except EOFError:
+            return
+        if ans not in ("y", "yes"):
+            return
+    try:
+        cmd_check_update()
+    except Err as e:
+        warn(str(e))
+
+
 def cmd_logs(inst, token, follow, daemon):
     if daemon:
         dc = DaemonController(inst)
@@ -2059,16 +2107,14 @@ def cmd_logs(inst, token, follow, daemon):
 def cmd_config(inst):
     print("config file: {}".format(inst.path))
     print("instance: {}".format(inst.name))
-    mgr_note = ""
-    if inst.manager == "auto" and inst.local_pools():
-        mgr_note = "  (resolves locally to: {})".format(
-            DaemonController(inst).mode)
-    print("manager: {}{}".format(inst.manager, mgr_note))
+    if inst.local_pools() and local_manager(inst) == "auto":
+        print("manager (this machine): auto  (resolves to: {})".format(
+            DaemonController(inst).mode))
     for pool in inst.pools.values():
         print("[pool.{}]".format(pool.name) if not inst.single or pool.name != "default"
               else "[pool]")
         for key in ("url", "count", "labels", "base_dir", "version",
-                    "name_prefix", "group", "dir_prefix", "host"):
+                    "name_prefix", "group", "dir_prefix", "host", "manager"):
             val = getattr(pool, key)
             shown = val if isinstance(val, str) else json.dumps(val)
             print("  {} = {}".format(key, shown))
@@ -2170,6 +2216,7 @@ def main(argv=None):
             cmd_reload(inst)
         elif args.cmd in ("status", "ps"):
             cmd_status(inst)
+            maybe_offer_update(inst)
         elif args.cmd == "down":
             cmd_down(inst, args.force, args.dry_run)
         elif args.cmd == "rm":
