@@ -39,8 +39,8 @@ import urllib.request
 
 from collections import OrderedDict
 
-VERSION = "0.4.2"
-RAW_SELF_URL = "https://raw.githubusercontent.com/flinner/gh-runnerctl/main/runnerctl"
+VERSION = "0.5.0"
+RAW_SELF_URL = "https://raw.githubusercontent.com/flinner/gh-runnerctl/main/gh-runnerctl"
 
 API_ROOT = "https://api.github.com"
 REMOTE_BASE = "$HOME/.local/share/runnerctl"
@@ -1512,11 +1512,20 @@ def _vtuple(v):
     return tuple(int(x) for x in re.findall(r"\d+", v)[:3]) or (0,)
 
 
+def _gh_extension_install():
+    # installed via `gh extension install` — the script lives inside gh's
+    # managed clone (~/.local/share/gh/extensions/gh-runnerctl/)
+    path = os.path.realpath(os.path.abspath(sys.argv[0]))
+    return "{0}gh{0}extensions{0}".format(os.sep) in path
+
+
 def cmd_check_update():
     _, remote = _fetch_self()
     if _vtuple(remote) > _vtuple(VERSION):
-        info("update available: v{} -> v{}  (run `runnerctl update`)".format(
-            VERSION, remote))
+        cmd = ("gh extension upgrade runnerctl" if _gh_extension_install()
+               else "runnerctl update")
+        info("update available: v{} -> v{}  (run `{}`)".format(
+            VERSION, remote, cmd))
     elif _vtuple(remote) == _vtuple(VERSION):
         ok("up to date (v{})".format(VERSION))
     else:
@@ -1525,6 +1534,9 @@ def cmd_check_update():
 
 
 def cmd_update():
+    if _gh_extension_install():
+        raise Err("this copy is managed by the gh CLI — "
+                  "run `gh extension upgrade runnerctl` instead")
     text, remote = _fetch_self()
     if _vtuple(remote) <= _vtuple(VERSION):
         ok("already up to date (v{})".format(VERSION))

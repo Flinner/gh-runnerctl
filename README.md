@@ -5,7 +5,7 @@
 **One Python file. Standard library only. Nothing to install on remote hosts.**
 
 [![Python](https://img.shields.io/badge/python-3.6%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-0.4.2-blue)](https://github.com/flinner/gh-runnerctl/blob/main/runnerctl)
+[![Version](https://img.shields.io/badge/version-0.5.0-blue)](https://github.com/flinner/gh-runnerctl/blob/main/gh-runnerctl)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)](#install)
 [![Platform](https://img.shields.io/badge/platform-linux-lightgrey)](#limitations)
@@ -74,10 +74,21 @@ nodes, shared lab workstations, locked-down VMs:
 ## Install
 
 ```bash
-curl -fLo ~/.local/bin/runnerctl https://raw.githubusercontent.com/flinner/gh-runnerctl/main/runnerctl
+curl -fLo ~/.local/bin/runnerctl https://raw.githubusercontent.com/flinner/gh-runnerctl/main/gh-runnerctl
 chmod +x ~/.local/bin/runnerctl
 curl -fLo runners.toml https://raw.githubusercontent.com/flinner/gh-runnerctl/main/runners.toml.example
 ```
+
+Or, if you already use the [`gh` CLI](https://cli.github.com/), as an extension
+(auth comes from your `gh` login automatically):
+
+```bash
+gh extension install Flinner/gh-runnerctl
+gh runnerctl init && gh runnerctl up      # every command works as `gh runnerctl ...`
+```
+
+Updates then come from `gh extension upgrade runnerctl` (and `check-update`
+knows to say so).
 
 Updating is never automatic: `runnerctl check-update` tells you when a newer
 version exists (and prints the command), `runnerctl update` installs it in
