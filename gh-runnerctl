@@ -96,6 +96,11 @@ class Err(Exception):
     pass
 
 
+class NotDeployed(Err):
+    """ssh reached the host, but runnerctl itself is not there yet."""
+    pass
+
+
 # ---------------------------------------------------------------- output
 
 GREEN, RED, YELLOW, DIM, CYAN, BOLD = "32", "31", "33", "2", "36", "1"
@@ -762,8 +767,8 @@ class RemoteHost:
             return self._state
         rc, out, errout = self.invoke(inst, ["agent-status"], deploy=deploy)
         if rc == 127:
-            raise Err("runnerctl is not deployed on {} yet "
-                      "(`runnerctl up` deploys it)".format(self.host))
+            raise NotDeployed("runnerctl is not deployed on {} yet "
+                              "(`runnerctl up` deploys it)".format(self.host))
         if rc != 0:
             raise Err("agent-status on {} failed: {}".format(
                 self.host, (errout or out).strip()))
@@ -812,6 +817,15 @@ def host_slug(host):
         return re.sub(r"[^A-Za-z0-9_-]", "-", bare).strip("-")
     short = re.sub(r"[^A-Za-z0-9_-]", "-", first).strip("-")
     return short or re.sub(r"[^A-Za-z0-9_-]", "-", bare).strip("-")
+
+
+def supervisor_label(host):
+    """Label for a remote supervisor line: 'supervisor@alias' for a bare ssh
+    alias, 'supervisor on user@node' when the destination already carries a
+    user, so the label never reads as one mangled ssh target."""
+    if "@" in host:
+        return "supervisor on " + host
+    return "supervisor@" + host
 
 
 def machine_id(inst):
@@ -1975,7 +1989,7 @@ def cmd_status(inst):
     print()
     print("{} {}   config={}   pools: {}".format(
         paint("instance", BOLD), inst.name, inst.path,
-        ", ".join("{}{}={}".format(p.name, "@" + p.host if p.host else "", p.count)
+        ", ".join("{}{}={}".format(p.name, "@" + host_slug(p.host) if p.host else "", p.count)
                   for p in inst.pools.values())))
     if show_local:
         dstate = ("running (pid {}, {})".format(dc.pid(), dc.mode)
@@ -1985,18 +1999,25 @@ def cmd_status(inst):
         if not local_daemon_up and any(local_indices(p) for p in inst.local_pools()):
             warn("local supervisor not running — `runnerctl up` starts it")
     host_states = {}
+    host_fail = {}
     for host in rhosts:
+        label = paint(supervisor_label(host), BOLD)
         try:
             host_states[host] = rhosts[host].state(inst, deploy=False)
             d = host_states[host].get("daemon", {})
             dstate = ("running (pid {}, {})".format(d.get("pid"), d.get("mode"))
                       if d.get("running") else "stopped")
-            print("{} {}".format(paint("supervisor@" + host, BOLD),
+            print("{} {}".format(label,
                                  paint(dstate, GREEN if d.get("running") else RED)))
+        except NotDeployed as e:
+            host_states[host] = None
+            host_fail[host] = "not deployed (run `runnerctl up`)"
+            print("{} {}".format(label, paint("not deployed", YELLOW)))
+            warn(str(e))
         except Err as e:
             host_states[host] = None
-            print("{} {}".format(paint("supervisor@" + host, BOLD),
-                                 paint("unreachable", RED)))
+            host_fail[host] = "host unreachable"
+            print("{} {}".format(label, paint("unreachable", RED)))
             warn(str(e))
     api_errs = {}
     remotes = {}
@@ -2049,7 +2070,8 @@ def cmd_status(inst):
                 continue
             display = name or default_name(pool, i)
             if pool.host and st is None:
-                gh_state, job, note = "?", "?", "host unreachable"
+                note = host_fail.get(pool.host, "host unreachable")
+                gh_state, job = "?", "?"
                 entry = remote.get(display)
                 if entry:
                     gh_state = entry.get("status", "?")
