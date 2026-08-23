@@ -5,7 +5,7 @@
 **One Python file. Standard library only. Nothing to install on remote hosts.**
 
 [![Python](https://img.shields.io/badge/python-3.6%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-0.5.0-blue)](https://github.com/flinner/gh-runnerctl/blob/main/gh-runnerctl)
+[![Version](https://img.shields.io/badge/version-0.6.0-blue)](https://github.com/flinner/gh-runnerctl/blob/main/gh-runnerctl)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)](#install)
 [![Platform](https://img.shields.io/badge/platform-linux-lightgrey)](#limitations)
@@ -41,8 +41,9 @@ supervisor@gpunode running (pid 4482, systemd)
 **The config file is the interface.** Declare any number of pools in one
 `runners.toml`; edit it, then:
 
-- `runnerctl up` — full converge: download the runner release, register
-  missing runners, prune surplus ones, start/reload every supervisor.
+- `runnerctl up` — full converge: download and decompress each runner release
+  once, provision missing runners with bounded parallelism, prune surplus ones,
+  and start/reload every supervisor.
 - `runnerctl reload` — soft apply: running supervisors re-read the file and
   start/stop runner processes accordingly. No GitHub calls.
 
@@ -165,12 +166,13 @@ of it), or a bare index in single-pool files.
 | Command | Does |
 |---|---|
 | `init` | Write a starter `runners.toml` |
-| `up [--force] [-n]` | Converge every pool to the config (provision, register, supervise, prune) |
+| `up [--force] [-j N] [-n]` | Converge every pool; provision with N workers (default 4) |
 | `reload` | Supervisors re-read the config and apply it; no GitHub work |
 | `status` / `ps` | Pool table: supervisors + runner processes + GitHub online/busy |
 | `watch [-i SEC]` | Live-refreshing status (default every 10 s) |
 | `down [--force] [-n]` | Stop all supervisors and runners, keep registrations |
 | `rm <ref...> \| --all [--force] [-n]` | Deregister and delete runners |
+| `uninstall [-n]` | Remove and verify this instance's supervisors, units, state, and remote deployment; runners must be removed first |
 | `start` / `stop` / `restart <ref...>` | Per-runner control (stopped runners stay registered, not respawned) |
 | `logs [ref] [-f]`, `logs --daemon` | Runner logs / supervisor log (follows over ssh too) |
 | `config` | Print the resolved configuration |
@@ -212,6 +214,13 @@ the same supervisor runs as a detached process: per-runner crash restarts
 still work; only the supervisor itself isn't resurrected after reboot
 (re-run `runnerctl up`).
 
+**Uninstall is explicit and verified.** `runnerctl rm --all` removes runners,
+not their reusable control plane. After all local and GitHub registrations are
+gone, `runnerctl uninstall` stops each supervisor, disables and removes its
+user unit, removes its machine-scoped state and deployed instance config, and
+checks every postcondition. The shared remote `runnerctl` copy is removed only
+when no other deployed instance config still needs it.
+
 **Remote execution is runnerctl driving itself.** There is no agent
 protocol, no server, no remote install step. For a pool with `host = ...`,
 the CLI tars **its own script plus your `runners.toml` verbatim** and pipes
@@ -220,6 +229,13 @@ that through `ssh host 'tar -x'`; every command then re-pushes the config
 which means: *keep only the pools assigned to you, treat them as local*.
 The config is never rewritten or split per host — one file is the single
 source of truth everywhere, filtered at load time.
+
+**Provisioning shares immutable work.** A release archive is downloaded once
+per `base_dir` and version, then decompressed once into a pristine versioned
+template. Missing runner directories clone that template (using reflinks where
+the filesystem supports them) and register concurrently. `up --jobs N`
+controls the bounded worker count; the default is 4. Interactive manual-token
+registration stays serial so prompts cannot race.
 
 **Tokens flow one way, downhill, and expire.** Registration and removal need
 GitHub-side authority, so the control machine mints the short-lived
