@@ -40,7 +40,7 @@ import urllib.request
 
 from collections import OrderedDict
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 RAW_SELF_URL = "https://raw.githubusercontent.com/flinner/gh-runnerctl/main/gh-runnerctl"
 
 API_ROOT = "https://api.github.com"
@@ -2135,6 +2135,9 @@ def cmd_rm(inst, tokens, all_flag, force, dry=False):
     if still_wanted:
         warn("config still wants these; the next `runnerctl up` will "
              "re-provision {}".format(", ".join(sorted(set(still_wanted)))))
+    if all_flag:
+        warn("supervisor services and deployed control files remain installed; "
+             "run `runnerctl uninstall` after all runners are removed")
 
 
 def cmd_agent_uninstall(inst):
