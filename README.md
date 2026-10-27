@@ -4,6 +4,7 @@
 
 **One Python file. Standard library only. Nothing to install on remote hosts.**
 
+[![awesome-runners](https://img.shields.io/badge/listed%20on-awesome--runners-blue.svg)](https://github.com/jonico/awesome-runners)
 [![Python](https://img.shields.io/badge/python-3.6%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Version](https://img.shields.io/badge/version-0.6.1-blue)](https://github.com/flinner/gh-runnerctl/blob/main/gh-runnerctl)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
